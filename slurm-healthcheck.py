@@ -362,7 +362,7 @@ class SlurmHealthcheck:
         return None
     
     def _validate_backup_file(self, backup_file: str) -> Tuple[bool, str]:
-        """Validate a backup file is valid and restorable"""
+        """Validate a backup file is valid and restorable Slurm database backup"""
         # Check file exists
         if not os.path.exists(backup_file):
             return False, "Backup file does not exist"
@@ -379,35 +379,99 @@ class SlurmHealthcheck:
         if not os.access(backup_file, os.R_OK):
             return False, "Backup file is not readable"
         
+        # Slurm-specific table names to look for
+        slurm_tables = [
+            'acct_coord_table', 'acct_table', 'cluster_table', 'job_table',
+            'step_table', 'qos_table', 'tres_table', 'user_table', 'assoc_table',
+            'wckey_table', 'reservation_table', 'txn_table'
+        ]
+        
         # Try to identify file type and validate
         if backup_file.endswith('.sql') or backup_file.endswith('.dump'):
-            # Plain SQL file - check for SQL dump markers
+            # Plain SQL file - check for SQL dump markers and Slurm tables
             try:
+                content = ""
                 with open(backup_file, 'r') as f:
-                    first_lines = ''.join([f.readline() for _ in range(10)])
-                    if 'MySQL dump' in first_lines or 'MariaDB dump' in first_lines or \
-                       'CREATE' in first_lines or 'INSERT' in first_lines:
-                        return True, f"Valid SQL dump ({file_size:,} bytes)"
-                    else:
-                        return False, "File does not appear to be a valid SQL dump"
+                    # Read first 50 lines to check for Slurm tables
+                    content = ''.join([f.readline() for _ in range(50)])
+                
+                # Check for SQL dump format
+                is_sql_dump = any(marker in content for marker in 
+                                 ['MySQL dump', 'MariaDB dump', 'CREATE', 'INSERT'])
+                
+                if not is_sql_dump:
+                    return False, "File does not appear to be a valid SQL dump"
+                
+                # Check for Slurm database indicators
+                has_slurm_db = 'slurm' in content.lower() and 'acct' in content.lower()
+                has_slurm_tables = any(table in content for table in slurm_tables)
+                
+                if not has_slurm_db and not has_slurm_tables:
+                    return False, "SQL dump does not appear to be a Slurm accounting database"
+                
+                # Count how many Slurm tables found
+                found_tables = [t for t in slurm_tables if t in content]
+                
+                return True, f"Valid Slurm DB backup ({file_size:,} bytes, {len(found_tables)} Slurm tables found)"
             except Exception as e:
                 return False, f"Could not read file: {e}"
         
         elif backup_file.endswith('.gz'):
-            # Gzipped file - check it's valid gzip
+            # Gzipped file - check it's valid gzip and inspect contents
             returncode, stdout, stderr = self.run_command(['gzip', '-t', backup_file], timeout=10)
-            if returncode == 0:
-                return True, f"Valid gzipped backup ({file_size:,} bytes)"
-            else:
+            if returncode != 0:
                 return False, f"Corrupted gzip file: {stderr}"
+            
+            # Decompress first part to check for Slurm tables
+            try:
+                returncode, content, stderr = self.run_command(
+                    ['bash', '-c', f'zcat "{backup_file}" | head -n 100'],
+                    timeout=10
+                )
+                
+                if returncode == 0 and content:
+                    # Check for Slurm database indicators
+                    has_slurm_db = 'slurm' in content.lower() and 'acct' in content.lower()
+                    has_slurm_tables = any(table in content for table in slurm_tables)
+                    
+                    if not has_slurm_db and not has_slurm_tables:
+                        return False, "Gzipped backup does not appear to be a Slurm accounting database"
+                    
+                    found_tables = [t for t in slurm_tables if t in content]
+                    return True, f"Valid Slurm DB backup ({file_size:,} bytes, gzipped, {len(found_tables)} Slurm tables found)"
+                else:
+                    # Can't inspect contents, but gzip is valid
+                    return True, f"Valid gzipped backup ({file_size:,} bytes, content not verified)"
+            except Exception as e:
+                # If inspection fails, at least gzip is valid
+                return True, f"Valid gzipped backup ({file_size:,} bytes, inspection failed: {e})"
         
         elif backup_file.endswith('.bz2'):
             # Bzip2 file - check it's valid
             returncode, stdout, stderr = self.run_command(['bzip2', '-t', backup_file], timeout=10)
-            if returncode == 0:
-                return True, f"Valid bzip2 backup ({file_size:,} bytes)"
-            else:
+            if returncode != 0:
                 return False, f"Corrupted bzip2 file: {stderr}"
+            
+            # Try to decompress and check contents
+            try:
+                returncode, content, stderr = self.run_command(
+                    ['bash', '-c', f'bzcat "{backup_file}" | head -n 100'],
+                    timeout=10
+                )
+                
+                if returncode == 0 and content:
+                    has_slurm_db = 'slurm' in content.lower() and 'acct' in content.lower()
+                    has_slurm_tables = any(table in content for table in slurm_tables)
+                    
+                    if not has_slurm_db and not has_slurm_tables:
+                        return False, "Bzip2 backup does not appear to be a Slurm accounting database"
+                    
+                    found_tables = [t for t in slurm_tables if t in content]
+                    return True, f"Valid Slurm DB backup ({file_size:,} bytes, bzip2, {len(found_tables)} Slurm tables found)"
+                else:
+                    return True, f"Valid bzip2 backup ({file_size:,} bytes, content not verified)"
+            except Exception as e:
+                return True, f"Valid bzip2 backup ({file_size:,} bytes, inspection failed: {e})"
         
         else:
             # Unknown format, just check size
