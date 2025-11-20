@@ -102,9 +102,11 @@ class HealthcheckResults:
 class SlurmHealthcheck:
     """Main healthcheck class"""
     
-    def __init__(self, verbose: bool = False, quiet: bool = False, use_colors: bool = True):
+    def __init__(self, verbose: bool = False, quiet: bool = False, use_colors: bool = True, 
+                 maintenance_mode: bool = False):
         self.verbose = verbose
         self.quiet = quiet
+        self.maintenance_mode = maintenance_mode
         self.results: List[TestResult] = []
         self.bcm_version = None
         self.slurm_base_path = None
@@ -283,11 +285,17 @@ class SlurmHealthcheck:
             return
         
         print(f"\n{Colors.BOLD}{'=' * 65}")
-        print("SLURM CLUSTER HEALTHCHECK (BCM Environment)")
+        if self.maintenance_mode:
+            print("SLURM CLUSTER HEALTHCHECK (BCM Environment) - MAINTENANCE MODE")
+        else:
+            print("SLURM CLUSTER HEALTHCHECK (BCM Environment)")
         print('=' * 65 + Colors.RESET)
         print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Hostname: {os.uname().nodename}")
         print(f"User: {os.getenv('USER', 'unknown')}")
+        
+        if self.maintenance_mode:
+            print(f"{Colors.YELLOW}Mode: Maintenance Window (job submission tests disabled){Colors.RESET}")
         
         # BCM info
         if self.bcm_version:
@@ -467,9 +475,14 @@ class SlurmHealthcheck:
                 nodes[node_name] = {"state": state, "reason": reason}
                 state_counts[state] = state_counts.get(state, 0) + 1
                 
-                # Track problem nodes
-                if state.lower() not in ['idle', 'allocated', 'mixed', 'completing']:
-                    problem_nodes.append((node_name, state, reason))
+                # Track problem nodes (be lenient about drained in maintenance mode)
+                if self.maintenance_mode:
+                    # In maintenance mode, drained nodes are expected
+                    if state.lower() not in ['idle', 'allocated', 'mixed', 'completing', 'drained', 'draining', 'drain']:
+                        problem_nodes.append((node_name, state, reason))
+                else:
+                    if state.lower() not in ['idle', 'allocated', 'mixed', 'completing']:
+                        problem_nodes.append((node_name, state, reason))
         
         total_nodes = len(nodes)
         
@@ -589,6 +602,16 @@ class SlurmHealthcheck:
     
     def check_job_submission(self):
         """Test basic job submission"""
+        # Skip job submission tests in maintenance mode
+        if self.maintenance_mode:
+            self.add_result(
+                "Job Submission", "Basic Job Test",
+                TestStatus.SKIP,
+                "Skipped in maintenance mode (nodes may be drained)",
+                {"maintenance_mode": True}
+            )
+            return
+        
         # Use /cm/shared for test script (available to all nodes)
         test_script = '/cm/shared/slurm_healthcheck_test.sh'
         
@@ -1141,8 +1164,10 @@ def main():
         epilog="""
 Examples:
   %(prog)s                                      # Run standard healthcheck
+  %(prog)s --maint                              # Maintenance mode (skip job tests)
   %(prog)s --pre-upgrade -o baseline.json       # Capture baseline before upgrade
   %(prog)s --post-upgrade -b baseline.json      # Compare after upgrade
+  %(prog)s --maint --pre-upgrade -o baseline.json # Pre-upgrade check in maintenance
   %(prog)s -v                                   # Verbose output
   %(prog)s --json -o results.json               # JSON output
         """
@@ -1158,6 +1183,8 @@ Examples:
                         help='Disable colored output')
     parser.add_argument('-o', '--output', type=str,
                         help='Save results to file')
+    parser.add_argument('--maint', '--maintenance', action='store_true',
+                        help='Maintenance mode: skip job submission tests, expect drained nodes')
     parser.add_argument('--pre-upgrade', action='store_true',
                         help='Capture pre-upgrade baseline state')
     parser.add_argument('--post-upgrade', action='store_true',
@@ -1183,7 +1210,8 @@ Examples:
     healthcheck = SlurmHealthcheck(
         verbose=args.verbose,
         quiet=args.quiet or args.json,
-        use_colors=use_colors
+        use_colors=use_colors,
+        maintenance_mode=args.maint
     )
     
     # Pre-upgrade baseline capture
