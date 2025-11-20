@@ -699,24 +699,24 @@ class SlurmHealthcheck:
             )
     
     def check_logs(self):
-        """Check Slurm logs for recent errors"""
+        """Check Slurm logs for recent errors (last 8 hours)"""
         error_patterns = [r'error', r'fatal', r'critical']
         
         # Check controller logs on controller nodes
         if self.controller_nodes:
             for node in self.controller_nodes[:1]:  # Check first controller only
-                # Try journalctl first (common in modern systems)
+                # Try journalctl first (common in modern systems) - last 8 hours
                 returncode, stdout, stderr = self.run_ssh_command(
                     node,
-                    ['journalctl', '-u', 'slurmctld', '-n', '100', '--no-pager']
+                    ['journalctl', '-u', 'slurmctld', '--since', '-8h', '--no-pager']
                 )
                 
                 if returncode != 0:
-                    # Fallback to log file
+                    # Fallback to log file (approximate with tail -n 500 for ~8 hours)
                     log_file = '/var/log/slurm/slurmctld.log'
                     returncode, stdout, stderr = self.run_ssh_command(
                         node,
-                        ['tail', '-n', '100', log_file]
+                        ['tail', '-n', '500', log_file]
                     )
                     
                     if returncode != 0:
@@ -737,35 +737,35 @@ class SlurmHealthcheck:
                 
                 if error_lines:
                     status = TestStatus.WARN
-                    message = f"Found {len(error_lines)} error/warning line(s) in last 100 lines"
+                    message = f"Found {len(error_lines)} error/warning line(s) in last 8 hours"
                     if self.verbose:
                         message += "\n    " + "\n    ".join(error_lines[:3])
                 else:
                     status = TestStatus.PASS
-                    message = "No recent errors found"
+                    message = "No recent errors found (last 8 hours)"
                 
                 self.add_result(
                     "Logs", f"Controller Log on {node}",
                     status,
                     message,
-                    {"error_count": len(error_lines), "node": node}
+                    {"error_count": len(error_lines), "node": node, "timeframe": "8 hours"}
                 )
         
         # Check database logs on accounting nodes
         if self.accounting_nodes:
             for node in self.accounting_nodes[:1]:  # Check first accounting node only
-                # Try journalctl first
+                # Try journalctl first - last 8 hours
                 returncode, stdout, stderr = self.run_ssh_command(
                     node,
-                    ['journalctl', '-u', 'slurmdbd', '-n', '100', '--no-pager']
+                    ['journalctl', '-u', 'slurmdbd', '--since', '-8h', '--no-pager']
                 )
                 
                 if returncode != 0:
-                    # Fallback to log file
+                    # Fallback to log file (approximate with tail -n 500 for ~8 hours)
                     log_file = '/var/log/slurm/slurmdbd.log'
                     returncode, stdout, stderr = self.run_ssh_command(
                         node,
-                        ['tail', '-n', '100', log_file]
+                        ['tail', '-n', '500', log_file]
                     )
                     
                     if returncode != 0:
@@ -786,18 +786,18 @@ class SlurmHealthcheck:
                 
                 if error_lines:
                     status = TestStatus.WARN
-                    message = f"Found {len(error_lines)} error/warning line(s) in last 100 lines"
+                    message = f"Found {len(error_lines)} error/warning line(s) in last 8 hours"
                     if self.verbose:
                         message += "\n    " + "\n    ".join(error_lines[:3])
                 else:
                     status = TestStatus.PASS
-                    message = "No recent errors found"
+                    message = "No recent errors found (last 8 hours)"
                 
                 self.add_result(
                     "Logs", f"Database Log on {node}",
                     status,
                     message,
-                    {"error_count": len(error_lines), "node": node}
+                    {"error_count": len(error_lines), "node": node, "timeframe": "8 hours"}
                 )
     
     def check_munge(self):
