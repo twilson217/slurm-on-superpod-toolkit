@@ -102,9 +102,17 @@ class SlurmHealthcheck:
         self.verbose = verbose
         self.quiet = quiet
         self.results: List[TestResult] = []
+        self.bcm_version = None
+        self.slurm_base_path = None
+        self.controller_nodes = []
+        self.accounting_nodes = []
+        self.cmsh_path = None
         
         if not use_colors or not sys.stdout.isatty():
             Colors.disable()
+        
+        # Detect BCM environment
+        self._detect_bcm_environment()
     
     def run_command(self, cmd: List[str], timeout: int = 30, check: bool = False) -> Tuple[int, str, str]:
         """Run a shell command with timeout and error handling"""
@@ -123,6 +131,117 @@ class SlurmHealthcheck:
             return -1, "", f"Command not found: {cmd[0]}"
         except Exception as e:
             return -1, "", str(e)
+    
+    def _detect_bcm_environment(self):
+        """Detect BCM version and configuration"""
+        # Detect BCM version
+        cmd_conf = '/cm/local/apps/cmd/etc/cmd.conf'
+        if os.path.exists(cmd_conf):
+            returncode, stdout, _ = self.run_command(['grep', 'VERSION', cmd_conf])
+            if returncode == 0:
+                match = re.search(r'VERSION\s+(\d+)\.', stdout)
+                if match:
+                    self.bcm_version = int(match.group(1))
+        
+        # Determine Slurm base path based on BCM version
+        if self.bcm_version == 10:
+            self.slurm_base_path = '/cm/shared/apps/slurm'
+        elif self.bcm_version and self.bcm_version >= 11:
+            self.slurm_base_path = '/cm/local/apps/slurm'
+        else:
+            # Try to auto-detect
+            if os.path.exists('/cm/shared/apps/slurm/current'):
+                self.slurm_base_path = '/cm/shared/apps/slurm'
+                self.bcm_version = 10
+            elif os.path.exists('/cm/local/apps/slurm/current'):
+                self.slurm_base_path = '/cm/local/apps/slurm'
+                self.bcm_version = 11
+        
+        # Find cmsh
+        cmsh_locations = [
+            '/cm/local/apps/cmd/bin/cmsh',
+            '/usr/bin/cmsh',
+        ]
+        for location in cmsh_locations:
+            if os.path.exists(location):
+                self.cmsh_path = location
+                break
+        
+        # Discover controller and accounting nodes via cmsh
+        if self.cmsh_path:
+            self._discover_slurm_nodes()
+    
+    def _discover_slurm_nodes(self):
+        """Use cmsh to discover which nodes have slurmserver and slurmaccounting roles"""
+        if not self.cmsh_path:
+            return
+        
+        # Method 1: Query device mode to see all nodes and their roles
+        # Use: device; show -l | grep -i slurm
+        cmd = f'{self.cmsh_path} -c "device; show -l"'
+        returncode, stdout, _ = self.run_command(['bash', '-c', cmd], timeout=15)
+        if returncode == 0:
+            current_node = None
+            for line in stdout.split('\n'):
+                # Look for node names (lines with node identifiers)
+                node_match = re.match(r'^(\S+)\s+', line)
+                if node_match and not line.startswith(' '):
+                    current_node = node_match.group(1)
+                
+                # Look for role assignments in the line
+                if current_node and 'slurmserver' in line.lower():
+                    if current_node not in self.controller_nodes:
+                        self.controller_nodes.append(current_node)
+                
+                if current_node and 'slurmaccounting' in line.lower():
+                    if current_node not in self.accounting_nodes:
+                        self.accounting_nodes.append(current_node)
+        
+        # Method 2: Try direct role query
+        # Get list of devices with slurmserver role
+        cmd = f'{self.cmsh_path} -c "device; list -l slurmserver"'
+        returncode, stdout, _ = self.run_command(['bash', '-c', cmd], timeout=10)
+        if returncode == 0:
+            for line in stdout.split('\n'):
+                line = line.strip()
+                if line and 'PhysicalNode' in line:
+                    # Format: PhysicalNode  nodename  MAC  category  IP  ...
+                    # Node name is in the second column
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        node = parts[1]
+                        if node and node not in self.controller_nodes:
+                            self.controller_nodes.append(node)
+        
+        # Get list of devices with slurmaccounting role
+        cmd = f'{self.cmsh_path} -c "device; list -l slurmaccounting"'
+        returncode, stdout, _ = self.run_command(['bash', '-c', cmd], timeout=10)
+        if returncode == 0:
+            for line in stdout.split('\n'):
+                line = line.strip()
+                if line and 'PhysicalNode' in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        node = parts[1]
+                        if node and node not in self.accounting_nodes:
+                            self.accounting_nodes.append(node)
+        
+        # Method 3: If still no nodes found, try to parse from configurationoverlay
+        if not self.controller_nodes:
+            cmd = f'{self.cmsh_path} -c "configurationoverlay; show"'
+            returncode, stdout, _ = self.run_command(['bash', '-c', cmd], timeout=10)
+            if returncode == 0:
+                # Look for patterns like "slurmctl-01" or similar in the output
+                for match in re.finditer(r'\b([\w-]+(?:ctl|controller|slurm)[\w-]*)\b', stdout, re.IGNORECASE):
+                    node = match.group(1)
+                    if node not in self.controller_nodes:
+                        self.controller_nodes.append(node)
+    
+    def run_ssh_command(self, node: str, cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
+        """Run a command on a remote node via SSH"""
+        ssh_cmd = ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=5', 
+                   node] + cmd
+        return self.run_command(ssh_cmd, timeout=timeout)
     
     def add_result(self, category: str, name: str, status: TestStatus, 
                    message: str = "", details: Dict[str, Any] = None):
@@ -160,11 +279,19 @@ class SlurmHealthcheck:
             return
         
         print(f"\n{Colors.BOLD}{'=' * 65}")
-        print("SLURM CLUSTER HEALTHCHECK")
+        print("SLURM CLUSTER HEALTHCHECK (BCM Environment)")
         print('=' * 65 + Colors.RESET)
         print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Hostname: {os.uname().nodename}")
         print(f"User: {os.getenv('USER', 'unknown')}")
+        
+        # BCM info
+        if self.bcm_version:
+            print(f"BCM Version: {self.bcm_version}.x")
+        if self.slurm_base_path:
+            print(f"Slurm Base Path: {self.slurm_base_path}")
+        if self.controller_nodes:
+            print(f"Controller Node(s): {', '.join(self.controller_nodes)}")
         
         # Get Slurm version
         returncode, stdout, _ = self.run_command(['sinfo', '--version'])
@@ -227,38 +354,81 @@ class SlurmHealthcheck:
             return None
     
     def check_services(self):
-        """Check status of Slurm services"""
-        services = [
-            ('slurmctld', 'Slurm Controller'),
-            ('slurmdbd', 'Slurm Database Daemon'),
-        ]
-        
-        for service_name, display_name in services:
-            returncode, stdout, stderr = self.run_command(
-                ['systemctl', 'is-active', f'{service_name}.service']
-            )
-            
-            is_active = stdout.strip() == 'active'
-            
-            if is_active:
-                # Get uptime info
-                _, uptime_out, _ = self.run_command(
-                    ['systemctl', 'show', f'{service_name}.service', '--property=ActiveEnterTimestamp']
+        """Check status of Slurm services on controller/accounting nodes"""
+        # Check slurmctld on controller nodes
+        if self.controller_nodes:
+            for node in self.controller_nodes:
+                returncode, stdout, stderr = self.run_ssh_command(
+                    node,
+                    ['systemctl', 'is-active', 'slurmctld.service']
                 )
                 
-                self.add_result(
-                    "Services", f"{display_name} Status",
-                    TestStatus.PASS,
-                    f"{service_name} is active",
-                    {"status": "active", "details": uptime_out.strip()}
+                is_active = stdout.strip() == 'active'
+                
+                if is_active:
+                    # Get uptime info
+                    _, uptime_out, _ = self.run_ssh_command(
+                        node,
+                        ['systemctl', 'show', 'slurmctld.service', '--property=ActiveEnterTimestamp']
+                    )
+                    
+                    self.add_result(
+                        "Services", f"Slurm Controller on {node}",
+                        TestStatus.PASS,
+                        f"slurmctld is active on {node}",
+                        {"node": node, "status": "active", "details": uptime_out.strip()}
+                    )
+                else:
+                    self.add_result(
+                        "Services", f"Slurm Controller on {node}",
+                        TestStatus.FAIL,
+                        f"slurmctld is not active on {node}: {stdout.strip()}",
+                        {"node": node, "status": stdout.strip()}
+                    )
+        else:
+            self.add_result(
+                "Services", "Slurm Controller Discovery",
+                TestStatus.WARN,
+                "Could not discover controller nodes via cmsh",
+                {}
+            )
+        
+        # Check slurmdbd on accounting nodes
+        if self.accounting_nodes:
+            for node in self.accounting_nodes:
+                returncode, stdout, stderr = self.run_ssh_command(
+                    node,
+                    ['systemctl', 'is-active', 'slurmdbd.service']
                 )
-            else:
-                self.add_result(
-                    "Services", f"{display_name} Status",
-                    TestStatus.FAIL,
-                    f"{service_name} is not active: {stdout.strip()}",
-                    {"status": stdout.strip()}
-                )
+                
+                is_active = stdout.strip() == 'active'
+                
+                if is_active:
+                    _, uptime_out, _ = self.run_ssh_command(
+                        node,
+                        ['systemctl', 'show', 'slurmdbd.service', '--property=ActiveEnterTimestamp']
+                    )
+                    
+                    self.add_result(
+                        "Services", f"Slurm Database on {node}",
+                        TestStatus.PASS,
+                        f"slurmdbd is active on {node}",
+                        {"node": node, "status": "active", "details": uptime_out.strip()}
+                    )
+                else:
+                    self.add_result(
+                        "Services", f"Slurm Database on {node}",
+                        TestStatus.FAIL,
+                        f"slurmdbd is not active on {node}: {stdout.strip()}",
+                        {"node": node, "status": stdout.strip()}
+                    )
+        else:
+            self.add_result(
+                "Services", "Slurm Database Discovery",
+                TestStatus.WARN,
+                "Could not discover accounting nodes via cmsh",
+                {}
+            )
     
     def check_nodes(self) -> Dict[str, Any]:
         """Check compute node status"""
@@ -412,12 +582,13 @@ class SlurmHealthcheck:
     
     def check_job_submission(self):
         """Test basic job submission"""
-        test_script = '/tmp/slurm_healthcheck_test.sh'
+        # Use /cm/shared for test script (available to all nodes)
+        test_script = '/cm/shared/slurm_healthcheck_test.sh'
         
         # Create test script
         try:
             with open(test_script, 'w') as f:
-                f.write('#!/bin/bash\necho "Healthcheck test job"\nhostname\n')
+                f.write('#!/bin/bash\necho "Healthcheck test job"\nhostname\ndate\n')
             os.chmod(test_script, 0o755)
         except Exception as e:
             self.add_result(
@@ -428,10 +599,10 @@ class SlurmHealthcheck:
             )
             return
         
-        # Submit test job
+        # Submit test job with explicit working directory
         start_time = time.time()
         returncode, stdout, stderr = self.run_command(
-            ['srun', '--overlap', '-t', '00:01:00', test_script],
+            ['srun', '--overlap', '-t', '00:01:00', '-D', '/tmp', test_script],
             timeout=120
         )
         elapsed = time.time() - start_time
@@ -459,12 +630,19 @@ class SlurmHealthcheck:
     
     def check_pyxis(self):
         """Check Pyxis/Enroot configuration"""
-        # Check if Pyxis plugin exists
-        pyxis_paths = [
+        # Check if Pyxis plugin exists - use detected BCM path
+        pyxis_paths = []
+        
+        if self.slurm_base_path:
+            pyxis_paths.append(f'{self.slurm_base_path}/current/lib/slurm/spank_pyxis.so')
+        
+        # Fallback paths
+        pyxis_paths.extend([
+            '/cm/shared/apps/slurm/current/lib/slurm/spank_pyxis.so',
             '/cm/local/apps/slurm/current/lib/slurm/spank_pyxis.so',
             '/usr/lib/slurm/spank_pyxis.so',
             '/usr/lib64/slurm/spank_pyxis.so',
-        ]
+        ])
         
         pyxis_found = False
         pyxis_path = None
@@ -480,7 +658,7 @@ class SlurmHealthcheck:
                 "Pyxis", "Pyxis Installation",
                 TestStatus.SKIP,
                 "Pyxis plugin not found (may not be installed)",
-                {}
+                {"checked_paths": pyxis_paths[:3]}
             )
             return
         
@@ -518,57 +696,91 @@ class SlurmHealthcheck:
     
     def check_logs(self):
         """Check Slurm logs for recent errors"""
-        log_files = [
-            ('/var/log/slurm/slurmctld.log', 'Controller Log'),
-            ('/var/log/slurm/slurmdbd.log', 'Database Log'),
-        ]
-        
         error_patterns = [r'error', r'fatal', r'critical']
         
-        for log_file, display_name in log_files:
-            if not os.path.exists(log_file):
-                self.add_result(
-                    "Logs", f"{display_name} Check",
-                    TestStatus.SKIP,
-                    f"Log file not found: {log_file}",
-                    {}
+        # Check controller logs on controller nodes
+        if self.controller_nodes:
+            for node in self.controller_nodes[:1]:  # Check first controller only
+                log_file = '/var/log/slurm/slurmctld.log'
+                
+                returncode, stdout, stderr = self.run_ssh_command(
+                    node,
+                    ['tail', '-n', '100', log_file]
                 )
-                continue
-            
-            # Check last 100 lines for errors
-            returncode, stdout, stderr = self.run_command(['tail', '-n', '100', log_file])
-            
-            if returncode != 0:
+                
+                if returncode != 0:
+                    self.add_result(
+                        "Logs", f"Controller Log on {node}",
+                        TestStatus.SKIP,
+                        f"Unable to read log file: {stderr}",
+                        {}
+                    )
+                    continue
+                
+                error_lines = []
+                for line in stdout.split('\n'):
+                    for pattern in error_patterns:
+                        if re.search(pattern, line, re.IGNORECASE):
+                            error_lines.append(line.strip())
+                            break
+                
+                if error_lines:
+                    status = TestStatus.WARN
+                    message = f"Found {len(error_lines)} error/warning line(s) in last 100 lines"
+                    if self.verbose:
+                        message += "\n    " + "\n    ".join(error_lines[:3])
+                else:
+                    status = TestStatus.PASS
+                    message = "No recent errors found"
+                
                 self.add_result(
-                    "Logs", f"{display_name} Check",
-                    TestStatus.WARN,
-                    f"Unable to read log file: {stderr}",
-                    {}
+                    "Logs", f"Controller Log on {node}",
+                    status,
+                    message,
+                    {"error_count": len(error_lines), "node": node}
                 )
-                continue
-            
-            error_lines = []
-            for line in stdout.split('\n'):
-                for pattern in error_patterns:
-                    if re.search(pattern, line, re.IGNORECASE):
-                        error_lines.append(line.strip())
-                        break
-            
-            if error_lines:
-                status = TestStatus.WARN
-                message = f"Found {len(error_lines)} error/warning line(s) in last 100 lines"
-                if self.verbose:
-                    message += "\n    " + "\n    ".join(error_lines[:3])
-            else:
-                status = TestStatus.PASS
-                message = "No recent errors found"
-            
-            self.add_result(
-                "Logs", f"{display_name} Check",
-                status,
-                message,
-                {"error_count": len(error_lines)}
-            )
+        
+        # Check database logs on accounting nodes
+        if self.accounting_nodes:
+            for node in self.accounting_nodes[:1]:  # Check first accounting node only
+                log_file = '/var/log/slurm/slurmdbd.log'
+                
+                returncode, stdout, stderr = self.run_ssh_command(
+                    node,
+                    ['tail', '-n', '100', log_file]
+                )
+                
+                if returncode != 0:
+                    self.add_result(
+                        "Logs", f"Database Log on {node}",
+                        TestStatus.SKIP,
+                        f"Unable to read log file: {stderr}",
+                        {}
+                    )
+                    continue
+                
+                error_lines = []
+                for line in stdout.split('\n'):
+                    for pattern in error_patterns:
+                        if re.search(pattern, line, re.IGNORECASE):
+                            error_lines.append(line.strip())
+                            break
+                
+                if error_lines:
+                    status = TestStatus.WARN
+                    message = f"Found {len(error_lines)} error/warning line(s) in last 100 lines"
+                    if self.verbose:
+                        message += "\n    " + "\n    ".join(error_lines[:3])
+                else:
+                    status = TestStatus.PASS
+                    message = "No recent errors found"
+                
+                self.add_result(
+                    "Logs", f"Database Log on {node}",
+                    status,
+                    message,
+                    {"error_count": len(error_lines), "node": node}
+                )
     
     def check_munge(self):
         """Check munge authentication service"""
