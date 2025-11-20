@@ -20,11 +20,13 @@ import sys
 import os
 import time
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
+import configparser
+import glob
 
 
 class TestStatus(Enum):
@@ -113,9 +115,14 @@ class SlurmHealthcheck:
         self.controller_nodes = []
         self.accounting_nodes = []
         self.cmsh_path = None
+        self.config_file = '/root/slurm-upgrade/healthcheck-config.conf'
+        self.config = None
         
         if not use_colors or not sys.stdout.isatty():
             Colors.disable()
+        
+        # Load config file
+        self._load_config()
         
         # Detect BCM environment
         self._detect_bcm_environment()
@@ -248,6 +255,163 @@ class SlurmHealthcheck:
         ssh_cmd = ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=5', 
                    node] + cmd
         return self.run_command(ssh_cmd, timeout=timeout)
+    
+    def _load_config(self):
+        """Load configuration from config file"""
+        self.config = configparser.ConfigParser()
+        
+        # Try to find config file in multiple locations
+        possible_locations = [
+            '/root/slurm-upgrade/healthcheck-config.conf',
+            './healthcheck-config.conf',
+            '/etc/slurm-healthcheck/healthcheck-config.conf',
+        ]
+        
+        for location in possible_locations:
+            if os.path.exists(location):
+                self.config_file = location
+                try:
+                    self.config.read(location)
+                    return
+                except Exception as e:
+                    print(f"Warning: Could not read config file {location}: {e}", file=sys.stderr)
+        
+        # If no config file found, create empty config
+        if not self.config.sections():
+            # Create basic structure
+            self.config.add_section('accounting')
+    
+    def _get_backup_dir(self) -> Optional[str]:
+        """Get database backup directory from config"""
+        if not self.config or not self.config.has_section('accounting'):
+            return None
+        
+        return self.config.get('accounting', 'slurm_db_backup_dir', fallback=None)
+    
+    def _prompt_and_save_backup_dir(self) -> Optional[str]:
+        """Prompt user for backup directory and save to config"""
+        if self.quiet:
+            return None
+        
+        print(f"\n{Colors.YELLOW}Database backup directory not configured.{Colors.RESET}")
+        print("To enable backup validation, please enter the directory where")
+        print("Slurm database backups are stored.")
+        print("(Press Enter to skip)")
+        
+        try:
+            backup_dir = input(f"{Colors.BOLD}Backup directory path: {Colors.RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        
+        if not backup_dir:
+            return None
+        
+        # Validate directory exists
+        if not os.path.exists(backup_dir):
+            print(f"{Colors.RED}Warning: Directory does not exist: {backup_dir}{Colors.RESET}")
+            return None
+        
+        # Save to config
+        try:
+            if not self.config.has_section('accounting'):
+                self.config.add_section('accounting')
+            
+            self.config.set('accounting', 'slurm_db_backup_dir', backup_dir)
+            
+            with open(self.config_file, 'w') as f:
+                self.config.write(f)
+            
+            print(f"{Colors.GREEN}✓ Saved to {self.config_file}{Colors.RESET}")
+            return backup_dir
+        except Exception as e:
+            print(f"{Colors.RED}Error saving config: {e}{Colors.RESET}", file=sys.stderr)
+            return None
+    
+    def _find_latest_backup(self, backup_dir: str) -> Optional[Tuple[str, datetime]]:
+        """Find the most recent backup file in the directory"""
+        if not os.path.exists(backup_dir):
+            return None
+        
+        # Common backup file patterns
+        patterns = [
+            '*.sql',
+            '*.sql.gz',
+            '*.sql.bz2',
+            '*.dump',
+            '*.backup',
+            '*slurm*.sql*',
+            '*slurmdbd*.sql*',
+        ]
+        
+        latest_file = None
+        latest_mtime = None
+        
+        for pattern in patterns:
+            for filepath in glob.glob(os.path.join(backup_dir, pattern)):
+                if os.path.isfile(filepath):
+                    mtime = os.path.getmtime(filepath)
+                    if latest_mtime is None or mtime > latest_mtime:
+                        latest_mtime = mtime
+                        latest_file = filepath
+        
+        if latest_file and latest_mtime:
+            backup_time = datetime.fromtimestamp(latest_mtime)
+            return (latest_file, backup_time)
+        
+        return None
+    
+    def _validate_backup_file(self, backup_file: str) -> Tuple[bool, str]:
+        """Validate a backup file is valid and restorable"""
+        # Check file exists
+        if not os.path.exists(backup_file):
+            return False, "Backup file does not exist"
+        
+        # Check file is not empty
+        file_size = os.path.getsize(backup_file)
+        if file_size == 0:
+            return False, "Backup file is empty (0 bytes)"
+        
+        if file_size < 1024:  # Less than 1KB
+            return False, f"Backup file suspiciously small ({file_size} bytes)"
+        
+        # Check file is readable
+        if not os.access(backup_file, os.R_OK):
+            return False, "Backup file is not readable"
+        
+        # Try to identify file type and validate
+        if backup_file.endswith('.sql') or backup_file.endswith('.dump'):
+            # Plain SQL file - check for SQL dump markers
+            try:
+                with open(backup_file, 'r') as f:
+                    first_lines = ''.join([f.readline() for _ in range(10)])
+                    if 'MySQL dump' in first_lines or 'MariaDB dump' in first_lines or \
+                       'CREATE' in first_lines or 'INSERT' in first_lines:
+                        return True, f"Valid SQL dump ({file_size:,} bytes)"
+                    else:
+                        return False, "File does not appear to be a valid SQL dump"
+            except Exception as e:
+                return False, f"Could not read file: {e}"
+        
+        elif backup_file.endswith('.gz'):
+            # Gzipped file - check it's valid gzip
+            returncode, stdout, stderr = self.run_command(['gzip', '-t', backup_file], timeout=10)
+            if returncode == 0:
+                return True, f"Valid gzipped backup ({file_size:,} bytes)"
+            else:
+                return False, f"Corrupted gzip file: {stderr}"
+        
+        elif backup_file.endswith('.bz2'):
+            # Bzip2 file - check it's valid
+            returncode, stdout, stderr = self.run_command(['bzip2', '-t', backup_file], timeout=10)
+            if returncode == 0:
+                return True, f"Valid bzip2 backup ({file_size:,} bytes)"
+            else:
+                return False, f"Corrupted bzip2 file: {stderr}"
+        
+        else:
+            # Unknown format, just check size
+            return True, f"Backup file exists ({file_size:,} bytes, format unknown)"
     
     def add_result(self, category: str, name: str, status: TestStatus, 
                    message: str = "", details: Dict[str, Any] = None):
@@ -866,6 +1030,79 @@ class SlurmHealthcheck:
                 {"status": stdout.strip()}
             )
     
+    def check_database_backup(self):
+        """Check for valid, recent database backup"""
+        # Get backup directory from config
+        backup_dir = self._get_backup_dir()
+        
+        if not backup_dir:
+            # Prompt user for backup directory (only in interactive mode)
+            if not self.quiet and sys.stdin.isatty():
+                backup_dir = self._prompt_and_save_backup_dir()
+            
+            if not backup_dir:
+                self.add_result(
+                    "Backup", "Database Backup Check",
+                    TestStatus.SKIP,
+                    "Backup directory not configured (set slurm_db_backup_dir in config)",
+                    {}
+                )
+                return
+        
+        # Find latest backup
+        backup_info = self._find_latest_backup(backup_dir)
+        
+        if not backup_info:
+            self.add_result(
+                "Backup", "Database Backup Check",
+                TestStatus.FAIL,
+                f"No backup files found in {backup_dir}",
+                {"backup_dir": backup_dir}
+            )
+            return
+        
+        backup_file, backup_time = backup_info
+        backup_age_hours = (datetime.now() - backup_time).total_seconds() / 3600
+        
+        # Validate backup file
+        is_valid, validation_msg = self._validate_backup_file(backup_file)
+        
+        if not is_valid:
+            self.add_result(
+                "Backup", "Database Backup Check",
+                TestStatus.FAIL,
+                f"Latest backup is invalid: {validation_msg}",
+                {
+                    "backup_file": backup_file,
+                    "backup_age_hours": round(backup_age_hours, 1),
+                    "validation_error": validation_msg
+                }
+            )
+            return
+        
+        # Check backup age
+        max_age = self.config.getint('accounting', 'max_backup_age_hours', fallback=24)
+        
+        if backup_age_hours > max_age:
+            status = TestStatus.WARN
+            message = f"Backup is {backup_age_hours:.1f} hours old (max: {max_age}h)"
+        else:
+            status = TestStatus.PASS
+            message = f"Valid backup found ({backup_age_hours:.1f} hours old)"
+        
+        self.add_result(
+            "Backup", "Database Backup Check",
+            status,
+            message,
+            {
+                "backup_file": os.path.basename(backup_file),
+                "backup_path": backup_file,
+                "backup_age_hours": round(backup_age_hours, 1),
+                "backup_time": backup_time.strftime('%Y-%m-%d %H:%M:%S'),
+                "validation": validation_msg
+            }
+        )
+    
     # =========================================================================
     # BASELINE CAPTURE AND COMPARISON
     # =========================================================================
@@ -1139,6 +1376,7 @@ class SlurmHealthcheck:
         self.check_job_history()
         self.check_partitions()
         self.check_munge()
+        self.check_database_backup()
         self.check_logs()
         self.check_pyxis()
         self.check_job_submission()
