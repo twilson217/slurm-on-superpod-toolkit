@@ -88,9 +88,13 @@ class HealthcheckResults:
         """Determine overall cluster health status"""
         summary = self.summary()
         if summary['failed'] > 0:
-            return "CRITICAL"
+            # Determine severity of failures
+            if summary['failed'] >= 5 or summary['failed'] > summary['passed']:
+                return "CRITICAL"
+            else:
+                return "DEGRADED"
         elif summary['warnings'] > 0:
-            return "DEGRADED"
+            return "HEALTHY (with warnings)"
         else:
             return "HEALTHY"
 
@@ -317,11 +321,14 @@ class SlurmHealthcheck:
         print(f"{Colors.YELLOW}Warnings: {summary['warnings']}{Colors.RESET}")
         print(f"{Colors.CYAN}Skipped: {summary['skipped']}{Colors.RESET}")
         
+        # Color code based on status
         if overall == "HEALTHY":
+            color = Colors.GREEN
+        elif overall == "HEALTHY (with warnings)":
             color = Colors.GREEN
         elif overall == "DEGRADED":
             color = Colors.YELLOW
-        else:
+        else:  # CRITICAL
             color = Colors.RED
         
         print(f"\n{Colors.BOLD}Overall Status: {color}{overall}{Colors.RESET}")
