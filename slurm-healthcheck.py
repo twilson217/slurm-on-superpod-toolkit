@@ -634,14 +634,18 @@ class SlurmHealthcheck:
         pyxis_paths = []
         
         if self.slurm_base_path:
+            # Check both lib64 and lib (BCM typically uses lib64)
+            pyxis_paths.append(f'{self.slurm_base_path}/current/lib64/slurm/spank_pyxis.so')
             pyxis_paths.append(f'{self.slurm_base_path}/current/lib/slurm/spank_pyxis.so')
         
-        # Fallback paths
+        # Fallback paths (check lib64 first, then lib)
         pyxis_paths.extend([
+            '/cm/shared/apps/slurm/current/lib64/slurm/spank_pyxis.so',
             '/cm/shared/apps/slurm/current/lib/slurm/spank_pyxis.so',
+            '/cm/local/apps/slurm/current/lib64/slurm/spank_pyxis.so',
             '/cm/local/apps/slurm/current/lib/slurm/spank_pyxis.so',
-            '/usr/lib/slurm/spank_pyxis.so',
             '/usr/lib64/slurm/spank_pyxis.so',
+            '/usr/lib/slurm/spank_pyxis.so',
         ])
         
         pyxis_found = False
@@ -701,21 +705,28 @@ class SlurmHealthcheck:
         # Check controller logs on controller nodes
         if self.controller_nodes:
             for node in self.controller_nodes[:1]:  # Check first controller only
-                log_file = '/var/log/slurm/slurmctld.log'
-                
+                # Try journalctl first (common in modern systems)
                 returncode, stdout, stderr = self.run_ssh_command(
                     node,
-                    ['tail', '-n', '100', log_file]
+                    ['journalctl', '-u', 'slurmctld', '-n', '100', '--no-pager']
                 )
                 
                 if returncode != 0:
-                    self.add_result(
-                        "Logs", f"Controller Log on {node}",
-                        TestStatus.SKIP,
-                        f"Unable to read log file: {stderr}",
-                        {}
+                    # Fallback to log file
+                    log_file = '/var/log/slurm/slurmctld.log'
+                    returncode, stdout, stderr = self.run_ssh_command(
+                        node,
+                        ['tail', '-n', '100', log_file]
                     )
-                    continue
+                    
+                    if returncode != 0:
+                        self.add_result(
+                            "Logs", f"Controller Log on {node}",
+                            TestStatus.SKIP,
+                            f"Unable to read logs (tried journalctl and {log_file})",
+                            {}
+                        )
+                        continue
                 
                 error_lines = []
                 for line in stdout.split('\n'):
@@ -743,21 +754,28 @@ class SlurmHealthcheck:
         # Check database logs on accounting nodes
         if self.accounting_nodes:
             for node in self.accounting_nodes[:1]:  # Check first accounting node only
-                log_file = '/var/log/slurm/slurmdbd.log'
-                
+                # Try journalctl first
                 returncode, stdout, stderr = self.run_ssh_command(
                     node,
-                    ['tail', '-n', '100', log_file]
+                    ['journalctl', '-u', 'slurmdbd', '-n', '100', '--no-pager']
                 )
                 
                 if returncode != 0:
-                    self.add_result(
-                        "Logs", f"Database Log on {node}",
-                        TestStatus.SKIP,
-                        f"Unable to read log file: {stderr}",
-                        {}
+                    # Fallback to log file
+                    log_file = '/var/log/slurm/slurmdbd.log'
+                    returncode, stdout, stderr = self.run_ssh_command(
+                        node,
+                        ['tail', '-n', '100', log_file]
                     )
-                    continue
+                    
+                    if returncode != 0:
+                        self.add_result(
+                            "Logs", f"Database Log on {node}",
+                            TestStatus.SKIP,
+                            f"Unable to read logs (tried journalctl and {log_file})",
+                            {}
+                        )
+                        continue
                 
                 error_lines = []
                 for line in stdout.split('\n'):
