@@ -44,13 +44,36 @@ For compute nodes: **30-60 minutes per 10 nodes per head node** (max 10 concurre
    cp -r /cm/local/apps/slurm /cm/local/apps/slurm.backup.$(date +%Y%m%d)
    ```
 
-3. **Identify software image path for compute nodes**:
+3. **Backup systemd unit files and scripts** (CRITICAL - these get modified during upgrade):
+   ```bash
+   # Create backup directory
+   mkdir -p /root/slurm-upgrade-backups/$(date +%Y%m%d)
+   
+   # Backup systemd unit files (on both head nodes)
+   cp /usr/lib/systemd/system/slurmctld.service /root/slurm-upgrade-backups/$(date +%Y%m%d)/
+   cp /usr/lib/systemd/system/slurmdbd.service /root/slurm-upgrade-backups/$(date +%Y%m%d)/
+   cp /usr/lib/systemd/system/slurmd.service /root/slurm-upgrade-backups/$(date +%Y%m%d)/
+   
+   # Backup systemd drop-in files if they exist
+   cp -r /etc/systemd/system/slurmctld.service.d /root/slurm-upgrade-backups/$(date +%Y%m%d)/ 2>/dev/null || true
+   cp -r /etc/systemd/system/slurmdbd.service.d /root/slurm-upgrade-backups/$(date +%Y%m%d)/ 2>/dev/null || true
+   
+   # Backup EpilogSlurmctld script (gets deleted during upgrade!)
+   if [ -f /usr/local/sbin/slurmctldepilog.sh ]; then
+       cp /usr/local/sbin/slurmctldepilog.sh /root/slurm-upgrade-backups/$(date +%Y%m%d)/
+   fi
+   
+   # Verify backups
+   ls -lah /root/slurm-upgrade-backups/$(date +%Y%m%d)/
+   ```
+
+4. **Identify software image path for compute nodes**:
    ```bash
    cmsh
    device; use <node-name>; show | grep "Software image"
    ```
 
-4. **Verify BCM repository access**:
+5. **Verify BCM repository access**:
    ```bash
    apt update
    apt-cache search slurm24.11
@@ -247,7 +270,44 @@ For compute nodes: **30-60 minutes per 10 nodes per head node** (max 10 concurre
    # Should see spank_pyxis.so for version 24.11
    ```
 
-### Step 11: Start Slurm Services and Resume Nodes (5 min)
+### Step 11: Restore Systemd Unit Files and Scripts (5 min) **CRITICAL**
+
+**NOTE**: The upgrade process modifies systemd unit files and may delete custom scripts. These must be restored before starting services!
+
+1. **Restore systemd unit files on both head nodes** (if they were modified during upgrade):
+   ```bash
+   # Check if unit files need restoration by comparing with backups
+   diff /usr/lib/systemd/system/slurmctld.service /root/slurm-upgrade-backups/$(date +%Y%m%d)/slurmctld.service
+   diff /usr/lib/systemd/system/slurmdbd.service /root/slurm-upgrade-backups/$(date +%Y%m%d)/slurmdbd.service
+   
+   # If needed, apply specific fixes from backup or use BCM documentation
+   # Common issues: Type=forking vs Type=simple, missing -D flag, wrong config paths
+   ```
+
+2. **Restore EpilogSlurmctld script** (gets deleted during upgrade!):
+   ```bash
+   # Restore the epilog script on both head nodes
+   if [ -f /root/slurm-upgrade-backups/$(date +%Y%m%d)/slurmctldepilog.sh ]; then
+       cp /root/slurm-upgrade-backups/$(date +%Y%m%d)/slurmctldepilog.sh /usr/local/sbin/
+       chmod a+x /usr/local/sbin/slurmctldepilog.sh
+       echo "EpilogSlurmctld script restored"
+   fi
+   
+   # Verify it exists
+   ls -la /usr/local/sbin/slurmctldepilog.sh
+   ```
+
+3. **Apply systemd fixes if needed** (per CBU_Upgrade.txt recommendations):
+   ```bash
+   # If slurmdbd.service fails to start, you may need to:
+   # - Change Type=forking to Type=simple
+   # - Add -D flag to ExecStart line
+   
+   # After any changes:
+   systemctl daemon-reload
+   ```
+
+### Step 12: Start Slurm Services and Resume Nodes (5 min)
 
 1. **Start services via cmsh**:
    ```bash
@@ -259,7 +319,18 @@ For compute nodes: **30-60 minutes per 10 nodes per head node** (max 10 concurre
    quit
    ```
 
-2. **Resume drained nodes**:
+2. **Verify services started successfully** (troubleshoot if needed):
+   ```bash
+   # On both head nodes:
+   systemctl status slurmctld
+   systemctl status slurmdbd
+   
+   # If services fail, check logs:
+   journalctl -u slurmctld -n 50
+   journalctl -u slurmdbd -n 50
+   ```
+
+3. **Resume drained nodes**:
    ```bash
    cmsh
    device
@@ -267,13 +338,13 @@ For compute nodes: **30-60 minutes per 10 nodes per head node** (max 10 concurre
    quit
    ```
 
-3. **Verify cluster status**:
+4. **Verify cluster status**:
    ```bash
    sinfo --version  # Should show slurm 24.11.x
    sinfo -N -l      # All nodes should be idle
    ```
 
-### Step 12: Validation Testing (10-15 min)
+### Step 13: Validation Testing (10-15 min)
 
 1. **Test basic job submission**:
    ```bash
@@ -300,7 +371,7 @@ For compute nodes: **30-60 minutes per 10 nodes per head node** (max 10 concurre
 
 ### **START OUTAGE WINDOW #2**
 
-**Repeat Phase 2 Steps 1-12**, but replace all references to:
+**Repeat Phase 2 Steps 1-13**, but replace all references to:
 - Remove: `slurm24.11*` 
 - Install: `slurm25.05` packages
 - Set version: `25.05`
@@ -313,6 +384,7 @@ For compute nodes: **30-60 minutes per 10 nodes per head node** (max 10 concurre
 - Step 5: `set version 25.05`
 - Step 8: In chroot - `apt remove slurm24.11* && apt install slurm25.05-client`
 - Step 10: `cm-wlm-setup --reinstall-pyxis` (for Slurm 25.05)
+- **Step 11: CRITICAL - Restore systemd unit files and EpilogSlurmctld script again!**
 
 ### **END OUTAGE WINDOW #2**
 
@@ -376,16 +448,113 @@ If issues occur during either upgrade phase:
 
 ---
 
+## Troubleshooting Common Issues
+
+### Issue 1: slurmctld/slurmdbd Services Won't Start After Upgrade
+
+**Symptoms**: 
+- `systemctl status slurmctld` shows failed/inactive
+- Error: "This host not a valid controller"
+- Error: "Invalid EpilogSlurmctld: No such file or directory"
+
+**Root Causes**:
+1. **Systemd unit files were reset during package upgrade** - The new packages install default unit files that may not work with BCM paths
+2. **EpilogSlurmctld script was deleted** - Custom prolog/epilog scripts in `/usr/local/sbin/` are removed during upgrade
+3. **Configuration paths mismatch** - Unit files look for configs in `/etc/slurm/` but BCM uses `/cm/shared/apps/slurm/var/etc/`
+4. **Manual edits to slurm.conf** - If slurm.conf was manually edited outside of cmsh, BCM may have incorrect controller hostnames
+
+**Solutions**:
+
+**A. Restore EpilogSlurmctld script** (required if you use prolog/epilog):
+```bash
+# Restore from backup
+cp /root/slurm-upgrade-backups/YYYYMMDD/slurmctldepilog.sh /usr/local/sbin/
+chmod a+x /usr/local/sbin/slurmctldepilog.sh
+```
+
+**B. Fix systemd unit files** (per CBU_Upgrade.txt recommendations):
+
+Edit `/usr/lib/systemd/system/slurmdbd.service`:
+- Change `Type=forking` to `Type=simple`
+- Change `ExecStart=...slurmdbd $OPTIONS` to `ExecStart=...slurmdbd -D`
+- Add `Environment="SLURM_CONF_DIR=/cm/shared/apps/slurm/var/etc"`
+- Update `ConditionPathExists=/cm/shared/apps/slurm/var/etc/slurmdbd.conf`
+
+Edit `/usr/lib/systemd/system/slurmctld.service`:
+- Change `Type=notify` to `Type=simple`  
+- Change `ExecStart=...slurmctld --systemd $OPTIONS` to `ExecStart=...slurmctld -D`
+- Add `Environment="SLURM_CONF=/cm/shared/apps/slurm/var/etc/slurm/slurm.conf"`
+- Update `ConditionPathExists=/cm/shared/apps/slurm/var/etc/slurm/slurm.conf`
+
+After changes:
+```bash
+systemctl daemon-reload
+systemctl restart slurmdbd
+systemctl restart slurmctld
+```
+
+**C. Fix slurm.conf controller hostname mismatch**:
+```bash
+# If you manually edited slurm.conf, BCM needs to regenerate it
+cmsh
+wlm use slurm
+rebuild
+commit
+quit
+
+# This will regenerate the AUTOGENERATED SECTION with correct hostnames
+```
+
+### Issue 2: Nodes Show as "Down" After Upgrade
+
+**Symptoms**:
+- `sinfo` shows nodes in `down` state
+- `slurmd` service fails on compute nodes
+
+**Solution**:
+```bash
+# Verify slurmd is running on compute nodes
+pdsh -w <node-range> "systemctl status slurmd"
+
+# If not running, restart
+pdsh -w <node-range> "systemctl daemon-reload && systemctl restart slurmd"
+
+# If still down, update node state in Slurm
+scontrol update NodeName=<node> State=RESUME
+```
+
+### Issue 3: Pyxis Container Jobs Fail
+
+**Symptoms**:
+- `srun --container-image=...` fails with plugin errors
+- Pyxis not found in plugin list
+
+**Solution**:
+```bash
+# Verify Pyxis is installed for current Slurm version
+ls -la /cm/shared/apps/slurm/current/lib*/slurm/spank_pyxis.so
+
+# If missing, reinstall
+cm-wlm-setup --reinstall-pyxis
+
+# Restart slurmctld
+systemctl restart slurmctld
+```
+
+---
+
 ## Key Considerations
 
 1. **Jobs must not be running during upgrade** - the admin manual strongly recommends this
 2. **Test in lab environment first** - validate impact of upgrades before production
-3. **Backup everything** - configurations, images, database
+3. **Backup everything** - configurations, images, database, **systemd unit files**, and **prolog/epilog scripts**
 4. **Both head nodes must be upgraded** - do not leave versions mismatched
 5. **All Slurm packages must match versions** - across all nodes
 6. **Pyxis must be reinstalled after each major version upgrade**
 7. **Communication** - notify users well in advance of maintenance windows
-8. **systemd service files may need adjustment** - particularly slurmdbd.service
+8. **systemd service files WILL be reset during upgrade** - backup and restore them per Step 11
+9. **Custom scripts in /usr/local/sbin/ are deleted** - backup EpilogSlurmctld and similar scripts before upgrading
+10. **BCM must control slurm.conf AUTOGENERATED sections** - do not manually edit, use `cmsh` to regenerate if needed
 
 ## Time Estimates Summary
 
