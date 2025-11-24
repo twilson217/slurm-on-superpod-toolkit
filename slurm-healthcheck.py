@@ -476,6 +476,43 @@ class SlurmHealthcheck:
         else:
             # Unknown format, just check size
             return True, f"Backup file exists ({file_size:,} bytes, format unknown)"
+
+    def _get_service_last_start_epoch(self, node: str, unit: str, grep_pattern: str) -> Optional[str]:
+        """
+        Find the last start time of a systemd service on a given node, as an epoch string.
+        Uses journalctl --output=short-unix and a grep pattern that matches the
+        service's startup message (e.g. 'slurmctld version').
+        """
+        # Ask journalctl for lines matching the pattern, in short-unix format
+        returncode, stdout, stderr = self.run_ssh_command(
+            node,
+            ['journalctl', '-u', unit, '--grep', grep_pattern, '--output=short-unix', '--no-pager'],
+            timeout=20,
+        )
+
+        if returncode != 0 or not stdout.strip():
+            return None
+
+        # Take the last matching line (most recent)
+        lines = [l for l in stdout.strip().split('\n') if l.strip()]
+        if not lines:
+            return None
+
+        last_line = lines[-1]
+        # short-unix format: "<epoch>.<usec> HOST PROC[PID]: msg..."
+        parts = last_line.split()
+        if not parts:
+            return None
+
+        epoch_part = parts[0]
+        # Strip microseconds if present
+        epoch = epoch_part.split('.')[0]
+
+        # Basic sanity check
+        if not epoch.isdigit():
+            return None
+
+        return epoch
     
     def add_result(self, category: str, name: str, status: TestStatus, 
                    message: str = "", details: Dict[str, Any] = None):
@@ -957,26 +994,68 @@ class SlurmHealthcheck:
             )
     
     def check_logs(self):
-        """Check Slurm logs for recent errors (last 8 hours)"""
+        """Check Slurm logs for recent errors, focusing on current state.
+
+        Strategy:
+        - Prefer log messages since the last successful service start (per service)
+        - Fall back to a time window (log_time_window_hours) if last start time not found
+        - Group and summarize error patterns instead of dumping raw lines
+        """
         error_patterns = [r'error', r'fatal', r'critical']
-        
+        log_hours = self.config.getint('log_checks', 'log_time_window_hours', fallback=8)
+
+        # Helper to analyze a block of log text and build a summary
+        def summarize_errors(raw_logs: str) -> Tuple[int, dict]:
+            error_counts: Dict[str, int] = {}
+
+            for line in raw_logs.split('\n'):
+                if not line.strip():
+                    continue
+                if not any(re.search(pat, line, re.IGNORECASE) for pat in error_patterns):
+                    continue
+
+                # Normalize message: drop timestamp/host, collapse PIDs
+                parts = line.split()
+                if len(parts) >= 5:
+                    msg = ' '.join(parts[4:])
+                else:
+                    msg = line
+                msg = re.sub(r'\[\d+\]', '[PID]', msg)
+                msg = msg.strip()
+
+                error_counts[msg] = error_counts.get(msg, 0) + 1
+
+            total_errors = sum(error_counts.values())
+            return total_errors, error_counts
+
         # Check controller logs on controller nodes
         if self.controller_nodes:
             for node in self.controller_nodes[:1]:  # Check first controller only
-                # Try journalctl first (common in modern systems) - last 8 hours
+                # Prefer logs since last successful start of slurmctld
+                last_start_epoch = self._get_service_last_start_epoch(
+                    node, 'slurmctld', 'slurmctld version'
+                )
+
+                if last_start_epoch:
+                    journal_args = ['--since', f'@{last_start_epoch}']
+                    timeframe_desc = "since last restart"
+                else:
+                    journal_args = ['--since', f'-{log_hours}h']
+                    timeframe_desc = f"last {log_hours} hours"
+
                 returncode, stdout, stderr = self.run_ssh_command(
                     node,
-                    ['journalctl', '-u', 'slurmctld', '--since', '-8h', '--no-pager']
+                    ['journalctl', '-u', 'slurmctld', '--no-pager'] + journal_args,
                 )
-                
+
                 if returncode != 0:
-                    # Fallback to log file (approximate with tail -n 500 for ~8 hours)
+                    # Fallback to log file (approximate with tail -n 500)
                     log_file = '/var/log/slurm/slurmctld.log'
                     returncode, stdout, stderr = self.run_ssh_command(
                         node,
                         ['tail', '-n', '500', log_file]
                     )
-                    
+
                     if returncode != 0:
                         self.add_result(
                             "Logs", f"Controller Log on {node}",
@@ -985,47 +1064,71 @@ class SlurmHealthcheck:
                             {}
                         )
                         continue
-                
-                error_lines = []
-                for line in stdout.split('\n'):
-                    for pattern in error_patterns:
-                        if re.search(pattern, line, re.IGNORECASE):
-                            error_lines.append(line.strip())
-                            break
-                
-                if error_lines:
+
+                total_errors, error_counts = summarize_errors(stdout)
+
+                if total_errors:
                     status = TestStatus.WARN
-                    message = f"Found {len(error_lines)} error/warning line(s) in last 8 hours"
-                    if self.verbose:
-                        message += "\n    " + "\n    ".join(error_lines[:3])
+                    message = f"Found {total_errors} error/warning line(s) {timeframe_desc}"
                 else:
                     status = TestStatus.PASS
-                    message = "No recent errors found (last 8 hours)"
-                
+                    message = f"No recent errors found ({timeframe_desc})"
+
+                # Build a compact summary of top error messages
+                summary_lines = []
+                if error_counts:
+                    top_msgs = sorted(
+                        error_counts.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True
+                    )[:3]
+                    for msg, count in top_msgs:
+                        summary_lines.append(f"{count}× {msg}")
+
+                    if self.verbose and summary_lines:
+                        message += "\n    " + "\n    ".join(summary_lines)
+
                 self.add_result(
                     "Logs", f"Controller Log on {node}",
                     status,
                     message,
-                    {"error_count": len(error_lines), "node": node, "timeframe": "8 hours"}
+                    {
+                        "error_count": total_errors,
+                        "node": node,
+                        "timeframe": timeframe_desc,
+                        "unique_error_patterns": len(error_counts),
+                        "top_errors": summary_lines,
+                    }
                 )
-        
+
         # Check database logs on accounting nodes
         if self.accounting_nodes:
             for node in self.accounting_nodes[:1]:  # Check first accounting node only
-                # Try journalctl first - last 8 hours
+                # Prefer logs since last successful start of slurmdbd
+                last_start_epoch = self._get_service_last_start_epoch(
+                    node, 'slurmdbd', 'slurmdbd version'
+                )
+
+                if last_start_epoch:
+                    journal_args = ['--since', f'@{last_start_epoch}']
+                    timeframe_desc = "since last restart"
+                else:
+                    journal_args = ['--since', f'-{log_hours}h']
+                    timeframe_desc = f"last {log_hours} hours"
+
                 returncode, stdout, stderr = self.run_ssh_command(
                     node,
-                    ['journalctl', '-u', 'slurmdbd', '--since', '-8h', '--no-pager']
+                    ['journalctl', '-u', 'slurmdbd', '--no-pager'] + journal_args,
                 )
-                
+
                 if returncode != 0:
-                    # Fallback to log file (approximate with tail -n 500 for ~8 hours)
+                    # Fallback to log file (approximate with tail -n 500)
                     log_file = '/var/log/slurm/slurmdbd.log'
                     returncode, stdout, stderr = self.run_ssh_command(
                         node,
                         ['tail', '-n', '500', log_file]
                     )
-                    
+
                     if returncode != 0:
                         self.add_result(
                             "Logs", f"Database Log on {node}",
@@ -1034,28 +1137,40 @@ class SlurmHealthcheck:
                             {}
                         )
                         continue
-                
-                error_lines = []
-                for line in stdout.split('\n'):
-                    for pattern in error_patterns:
-                        if re.search(pattern, line, re.IGNORECASE):
-                            error_lines.append(line.strip())
-                            break
-                
-                if error_lines:
+
+                total_errors, error_counts = summarize_errors(stdout)
+
+                if total_errors:
                     status = TestStatus.WARN
-                    message = f"Found {len(error_lines)} error/warning line(s) in last 8 hours"
-                    if self.verbose:
-                        message += "\n    " + "\n    ".join(error_lines[:3])
+                    message = f"Found {total_errors} error/warning line(s) {timeframe_desc}"
                 else:
                     status = TestStatus.PASS
-                    message = "No recent errors found (last 8 hours)"
-                
+                    message = f"No recent errors found ({timeframe_desc})"
+
+                summary_lines = []
+                if error_counts:
+                    top_msgs = sorted(
+                        error_counts.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True
+                    )[:3]
+                    for msg, count in top_msgs:
+                        summary_lines.append(f"{count}× {msg}")
+
+                    if self.verbose and summary_lines:
+                        message += "\n    " + "\n    ".join(summary_lines)
+
                 self.add_result(
                     "Logs", f"Database Log on {node}",
                     status,
                     message,
-                    {"error_count": len(error_lines), "node": node, "timeframe": "8 hours"}
+                    {
+                        "error_count": total_errors,
+                        "node": node,
+                        "timeframe": timeframe_desc,
+                        "unique_error_patterns": len(error_counts),
+                        "top_errors": summary_lines,
+                    }
                 )
     
     def check_munge(self):
