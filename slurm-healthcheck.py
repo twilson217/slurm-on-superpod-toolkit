@@ -1073,33 +1073,52 @@ class SlurmHealthcheck:
             # Approach 1: Try running mysql locally on the accounting node via SSH
             # Since we run as root, we can try socket auth if slurm user lacks privileges
             
-            # First, try with slurm credentials via SSH (if mysql client installed on node)
-            mysql_cmd_ssh = [
-                'mysql',
-                '-u', db_config['storage_user'],
-                f'-p{db_config["storage_pass"]}',
-                '-e', 'SHOW SLAVE STATUS\\G'
-            ]
+            # First, check if mysql command exists on the node
+            check_cmd_returncode, _, _ = self.run_ssh_command(node, ['which', 'mysql'], timeout=5)
+            mysql_on_node = (check_cmd_returncode == 0)
             
-            returncode, stdout, stderr = self.run_ssh_command(node, mysql_cmd_ssh, timeout=10)
-            
-            # If SHOW SLAVE STATUS doesn't work, try SHOW REPLICA STATUS (MariaDB 10.5+)
-            if returncode != 0 or not stdout.strip():
-                mysql_cmd_ssh[-1] = 'SHOW REPLICA STATUS\\G'
-                returncode, stdout, stderr = self.run_ssh_command(node, mysql_cmd_ssh, timeout=10)
-            
-            # If permission error with slurm user, try as MySQL root via socket auth
-            if returncode != 0 and ('Access denied' in stderr or 'SUPER' in stderr or 'SLAVE MONITOR' in stderr):
-                # Try connecting as MySQL root (Linux root user via socket auth)
-                mysql_cmd_root = ['mysql', '-e', 'SHOW SLAVE STATUS\\G']
-                returncode, stdout, stderr = self.run_ssh_command(node, mysql_cmd_root, timeout=10)
+            if mysql_on_node:
+                # Try with slurm credentials via SSH (force TCP with -h to avoid socket issues)
+                mysql_cmd_ssh = [
+                    'mysql',
+                    '-h', node,  # Force TCP connection
+                    '-u', db_config['storage_user'],
+                    f'-p{db_config["storage_pass"]}',
+                    '-e', 'SHOW SLAVE STATUS\\G'
+                ]
                 
+                returncode, stdout, stderr = self.run_ssh_command(node, mysql_cmd_ssh, timeout=10)
+                
+                # Filter out password warning from stderr for cleaner error messages
+                stderr_filtered = '\n'.join([line for line in stderr.split('\n') 
+                                            if 'password on the command line' not in line.lower()])
+                
+                # If SHOW SLAVE STATUS doesn't work, try SHOW REPLICA STATUS (MariaDB 10.5+)
                 if returncode != 0 or not stdout.strip():
-                    mysql_cmd_root[-1] = 'SHOW REPLICA STATUS\\G'
-                    returncode, stdout, stderr = self.run_ssh_command(node, mysql_cmd_root, timeout=10)
-            
-            # If SSH approach failed (mysql not installed), try from BCM head node
-            if returncode != 0 and 'command not found' in stderr:
+                    mysql_cmd_ssh[-1] = 'SHOW REPLICA STATUS\\G'
+                    returncode, stdout, stderr = self.run_ssh_command(node, mysql_cmd_ssh, timeout=10)
+                    stderr_filtered = '\n'.join([line for line in stderr.split('\n') 
+                                                if 'password on the command line' not in line.lower()])
+                
+                # If permission error with slurm user, try as MySQL root via socket auth
+                if returncode != 0 and ('Access denied' in stderr_filtered or 'SUPER' in stderr_filtered or 'SLAVE MONITOR' in stderr_filtered):
+                    # Try connecting as MySQL root (Linux root user via socket auth)
+                    # Try common socket locations
+                    for socket_path in ['/var/lib/mysql/mysql.sock', '/var/run/mysqld/mysqld.sock', '/tmp/mysql.sock']:
+                        mysql_cmd_root = ['mysql', f'--socket={socket_path}', '-e', 'SHOW SLAVE STATUS\\G']
+                        returncode, stdout, stderr = self.run_ssh_command(node, mysql_cmd_root, timeout=10)
+                        
+                        if returncode == 0:
+                            break  # Found working socket
+                        
+                        # Try SHOW REPLICA STATUS as well
+                        if returncode != 0 or not stdout.strip():
+                            mysql_cmd_root[-1] = 'SHOW REPLICA STATUS\\G'
+                            returncode, stdout, stderr = self.run_ssh_command(node, mysql_cmd_root, timeout=10)
+                            if returncode == 0:
+                                break
+            else:
+                # MySQL not on node, try from BCM head node
                 mysql_cmd_remote = [
                     'mysql',
                     '-h', node,
@@ -1109,48 +1128,61 @@ class SlurmHealthcheck:
                 ]
                 
                 returncode, stdout, stderr = self.run_command(mysql_cmd_remote, timeout=10)
+                stderr_filtered = '\n'.join([line for line in stderr.split('\n') 
+                                            if 'password on the command line' not in line.lower()])
                 
                 if returncode != 0 or not stdout.strip():
                     mysql_cmd_remote[-1] = 'SHOW REPLICA STATUS\\G'
                     returncode, stdout, stderr = self.run_command(mysql_cmd_remote, timeout=10)
+                    stderr_filtered = '\n'.join([line for line in stderr.split('\n') 
+                                                if 'password on the command line' not in line.lower()])
             
-            if returncode != 0:
-                # Check if it's a permission error
-                if 'Access denied' in stderr or 'SUPER' in stderr or 'SLAVE MONITOR' in stderr:
-                    self.add_result(
-                        "High Availability", f"DB Replication on {node}",
-                        TestStatus.SKIP,
-                        f"Insufficient MySQL privileges (need SUPER or SLAVE MONITOR). Install mysql-client on {node} for socket auth.",
-                        {"node": node, "error": "permission_denied"}
-                    )
-                elif 'command not found' in stderr:
-                    self.add_result(
-                        "High Availability", f"DB Replication on {node}",
-                        TestStatus.SKIP,
-                        f"mysql client not available. Install mysql-client on {node} or BCM head node.",
-                        {"node": node, "error": "mysql_not_found"}
-                    )
-                else:
-                    # No replication configured or can't access MySQL
-                    self.add_result(
-                        "High Availability", f"DB Replication on {node}",
-                        TestStatus.SKIP,
-                        f"Unable to check replication status (may not be configured)",
-                        {"node": node, "error": stderr.strip()[:100] if stderr else "unknown"}
-                    )
-                continue
-            
-            if not stdout.strip() or 'Empty set' in stdout:
-                # No replication configured on this node (might be the primary)
+            # Evaluate results
+            if returncode == 0 and not stdout.strip():
+                # Success but empty output = no replication configured
                 self.add_result(
                     "High Availability", f"DB Replication on {node}",
                     TestStatus.SKIP,
-                    f"No replication configured (may be primary node)",
-                    {"node": node}
+                    f"No MySQL replication configured (DB HA likely uses shared storage)",
+                    {"node": node, "replication": "not_configured"}
                 )
                 continue
+            elif returncode == 0 and stdout.strip():
+                # Successfully got replication status - parse it
+                pass  # Continue to parsing below
+            elif returncode != 0:
+                # Check specific error types
+                if not mysql_on_node and 'which' in str(check_cmd_returncode):
+                    self.add_result(
+                        "High Availability", f"DB Replication on {node}",
+                        TestStatus.SKIP,
+                        f"MySQL client not installed on {node}. Install with: apt install mysql-client",
+                        {"node": node, "error": "mysql_not_found"}
+                    )
+                elif 'Access denied' in stderr_filtered or 'SUPER' in stderr_filtered or 'SLAVE MONITOR' in stderr_filtered:
+                    self.add_result(
+                        "High Availability", f"DB Replication on {node}",
+                        TestStatus.SKIP,
+                        f"Insufficient MySQL privileges (need SUPER or SLAVE MONITOR)",
+                        {"node": node, "error": "permission_denied"}
+                    )
+                elif 'Can\'t connect' in stderr_filtered or 'Connection refused' in stderr_filtered:
+                    self.add_result(
+                        "High Availability", f"DB Replication on {node}",
+                        TestStatus.WARN,
+                        f"Cannot connect to MySQL on {node}",
+                        {"node": node, "error": stderr_filtered.strip()[:100] if stderr_filtered else "connection_failed"}
+                    )
+                else:
+                    self.add_result(
+                        "High Availability", f"DB Replication on {node}",
+                        TestStatus.SKIP,
+                        f"Unable to check replication status",
+                        {"node": node, "error": stderr_filtered.strip()[:100] if stderr_filtered else "unknown"}
+                    )
+                continue
             
-            # Parse replication status
+            # Parse replication status (only reached if returncode == 0 and stdout has content)
             slave_io_running = None
             slave_sql_running = None
             seconds_behind_master = None
