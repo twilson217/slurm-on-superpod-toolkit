@@ -863,23 +863,24 @@ class SlurmHealthcheck:
             else:
                 inactive_nodes.append(node)
         
-        # In a proper HA setup, typically only one slurmdbd should be active at a time
-        # The backup should be ready but not running, or running in standby mode
+        # In a proper HA setup, configurations vary:
+        # - Active-passive: only one slurmdbd active, others on standby
+        # - Active-active: multiple slurmdbd instances with shared storage
         issues = []
         
         if len(active_nodes) == 0:
             issues.append("No active slurmdbd service found")
             status = TestStatus.FAIL
+            message = "No active slurmdbd service"
         elif len(active_nodes) > 1:
-            # Multiple active slurmdbd instances - check if this is expected
-            # Some setups use active-active with shared storage, others use active-passive
-            issues.append(f"Multiple active slurmdbd instances: {', '.join(active_nodes)}")
-            status = TestStatus.WARN
-            message = f"Multiple slurmdbd active (verify if this is intended for your HA setup)"
+            # Multiple active slurmdbd instances - could be active-active HA or both primaries
+            # This is not necessarily an error, so we'll report it as info
+            status = TestStatus.PASS
+            message = f"Multiple slurmdbd active: {', '.join(active_nodes)} (active-active HA or transitioning state)"
         else:
             # Exactly one active - this is typical for active-passive HA
             status = TestStatus.PASS
-            message = f"Accounting HA healthy: active={active_nodes[0]}, standby={', '.join(inactive_nodes)}"
+            message = f"Accounting HA: active={active_nodes[0]}, standby={', '.join(inactive_nodes) if inactive_nodes else 'none'}"
         
         # Check database connectivity from each accounting node
         db_reachable = []
@@ -927,25 +928,86 @@ class SlurmHealthcheck:
         if len(self.accounting_nodes) >= 2:
             self._check_db_replication()
     
+    def _parse_slurmdbd_conf(self) -> dict:
+        """Parse slurmdbd.conf to extract database configuration"""
+        possible_paths = [
+            f'{self.slurm_base_path}/var/etc/slurmdbd.conf',
+            f'{self.slurm_base_path}/current/etc/slurmdbd.conf',
+            '/etc/slurm/slurmdbd.conf',
+            '/usr/local/etc/slurmdbd.conf',
+        ]
+        
+        conf_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                conf_path = path
+                break
+        
+        if not conf_path:
+            return {}
+        
+        config = {
+            'storage_host': 'localhost',
+            'storage_user': 'slurm',
+            'storage_pass': None,
+        }
+        
+        try:
+            with open(conf_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip().lower()
+                        value = value.strip()
+                        
+                        if key == 'storagehost':
+                            config['storage_host'] = value
+                        elif key == 'storageuser':
+                            config['storage_user'] = value
+                        elif key == 'storagepass':
+                            config['storage_pass'] = value
+            
+            return config
+        except Exception:
+            return {}
+    
     def _check_db_replication(self):
         """Check MySQL/MariaDB replication status between accounting nodes"""
         # This checks if database replication is configured and healthy
         # Note: This assumes standard MySQL/MariaDB replication setup
         
+        # Get database credentials from slurmdbd.conf
+        db_config = self._parse_slurmdbd_conf()
+        
+        # Build mysql command with credentials
+        mysql_cmd = ['mysql']
+        if db_config.get('storage_host'):
+            mysql_cmd.extend(['-h', db_config['storage_host']])
+        if db_config.get('storage_user'):
+            mysql_cmd.extend(['-u', db_config['storage_user']])
+        if db_config.get('storage_pass'):
+            mysql_cmd.extend([f'-p{db_config["storage_pass"]}'])
+        
         for node in self.accounting_nodes:
             # Check replication status
             # Try to get SHOW SLAVE STATUS (MySQL) or SHOW REPLICA STATUS (MariaDB 10.5+)
+            cmd = mysql_cmd + ['-e', 'SHOW SLAVE STATUS\\G']
             returncode, stdout, stderr = self.run_ssh_command(
                 node,
-                ['mysql', '-e', 'SHOW SLAVE STATUS\\G'],
+                cmd,
                 timeout=10
             )
             
             # If SHOW SLAVE STATUS doesn't work, try SHOW REPLICA STATUS
             if returncode != 0 or not stdout.strip():
+                cmd = mysql_cmd + ['-e', 'SHOW REPLICA STATUS\\G']
                 returncode, stdout, stderr = self.run_ssh_command(
                     node,
-                    ['mysql', '-e', 'SHOW REPLICA STATUS\\G'],
+                    cmd,
                     timeout=10
                 )
             
