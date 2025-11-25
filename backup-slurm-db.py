@@ -22,6 +22,19 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import glob
 
+# Optional default backup directory for this script, useful for cron jobs.
+# If you want a fixed default location when -o/--output-dir is NOT provided,
+# uncomment the line below and set it to your preferred directory, e.g.:
+#
+# SLURM_DB_DEFAULT_BACKUP_DIR = "/var/spool/cmd/backup"
+#
+# When left commented out, the script will use values from healthcheck-config.conf
+# or built-in fallback locations.
+try:
+    SLURM_DB_DEFAULT_BACKUP_DIR  # type: ignore[name-defined]
+except NameError:
+    SLURM_DB_DEFAULT_BACKUP_DIR = None
+
 
 class Colors:
     """ANSI color codes"""
@@ -126,6 +139,11 @@ class SlurmDatabaseBackup:
         """Determine backup directory"""
         if self.output_dir:
             return self.output_dir
+        
+        # Script-level default, intended for cron use when -o is not provided
+        global SLURM_DB_DEFAULT_BACKUP_DIR
+        if SLURM_DB_DEFAULT_BACKUP_DIR:
+            return SLURM_DB_DEFAULT_BACKUP_DIR
         
         # Try to read from healthcheck config
         healthcheck_conf = '/root/slurm-upgrade/healthcheck-config.conf'
