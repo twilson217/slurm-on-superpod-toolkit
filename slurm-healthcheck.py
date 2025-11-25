@@ -710,6 +710,319 @@ class SlurmHealthcheck:
                 {}
             )
     
+    def check_controller_ha(self):
+        """Check High Availability configuration for Slurm controllers"""
+        # Only test HA if we have multiple controller nodes
+        if not self.controller_nodes or len(self.controller_nodes) < 2:
+            self.add_result(
+                "High Availability", "Controller HA Configuration",
+                TestStatus.SKIP,
+                f"Single controller setup ({len(self.controller_nodes)} node), HA not applicable",
+                {"controller_count": len(self.controller_nodes)}
+            )
+            return
+        
+        # Use scontrol ping to check controller status
+        returncode, stdout, stderr = self.run_command(['scontrol', 'ping'], timeout=10)
+        
+        if returncode != 0:
+            self.add_result(
+                "High Availability", "Controller HA Status",
+                TestStatus.FAIL,
+                f"Unable to ping controllers: {stderr}",
+                {"error": stderr}
+            )
+            return
+        
+        # Parse scontrol ping output
+        # Expected format:
+        # Slurmctld(primary) at <hostname> is UP
+        # Slurmctld(backup) at <hostname> is UP
+        primary_controller = None
+        backup_controllers = []
+        controller_states = {}
+        
+        for line in stdout.split('\n'):
+            line = line.strip()
+            if not line or 'slurmctld' not in line.lower():
+                continue
+            
+            # Parse controller role and status
+            if 'primary' in line.lower():
+                # Extract hostname
+                match = re.search(r'at\s+(\S+)\s+is\s+(\w+)', line, re.IGNORECASE)
+                if match:
+                    hostname = match.group(1)
+                    status = match.group(2)
+                    primary_controller = hostname
+                    controller_states[hostname] = {'role': 'primary', 'status': status}
+            
+            elif 'backup' in line.lower():
+                match = re.search(r'at\s+(\S+)\s+is\s+(\w+)', line, re.IGNORECASE)
+                if match:
+                    hostname = match.group(1)
+                    status = match.group(2)
+                    backup_controllers.append(hostname)
+                    controller_states[hostname] = {'role': 'backup', 'status': status}
+        
+        # Validate HA configuration
+        issues = []
+        
+        # Check 1: Must have exactly one primary
+        if not primary_controller:
+            issues.append("No primary controller detected (split-brain or all down)")
+        elif len([c for c in controller_states.values() if c['role'] == 'primary']) > 1:
+            issues.append("Multiple primary controllers detected (split-brain condition)")
+        
+        # Check 2: Must have at least one backup
+        if not backup_controllers:
+            issues.append("No backup controller detected")
+        
+        # Check 3: All controllers should be UP
+        down_controllers = [host for host, info in controller_states.items() 
+                           if info['status'].upper() != 'UP']
+        if down_controllers:
+            issues.append(f"Controllers not responding: {', '.join(down_controllers)}")
+        
+        # Check 4: Verify all discovered nodes are accounted for
+        discovered_in_ping = set(controller_states.keys())
+        expected_nodes = set(self.controller_nodes)
+        missing_from_ping = expected_nodes - discovered_in_ping
+        if missing_from_ping:
+            issues.append(f"Controllers not in HA config: {', '.join(missing_from_ping)}")
+        
+        # Report results
+        if issues:
+            status = TestStatus.FAIL
+            message = f"HA issues detected: {'; '.join(issues)}"
+        else:
+            status = TestStatus.PASS
+            message = f"HA healthy: primary={primary_controller}, backup={', '.join(backup_controllers)}"
+        
+        self.add_result(
+            "High Availability", "Controller HA Status",
+            status,
+            message,
+            {
+                "primary": primary_controller,
+                "backups": backup_controllers,
+                "controller_states": controller_states,
+                "issues": issues
+            }
+        )
+        
+        # Additional check: Verify backup can communicate with primary
+        if primary_controller and backup_controllers and not issues:
+            # Test that backup controllers can reach primary via SSH
+            for backup in backup_controllers:
+                returncode, stdout, stderr = self.run_ssh_command(
+                    backup,
+                    ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                     primary_controller, 'hostname']
+                )
+                
+                if returncode == 0:
+                    self.add_result(
+                        "High Availability", f"Controller Connectivity: {backup} → {primary_controller}",
+                        TestStatus.PASS,
+                        f"Backup can reach primary",
+                        {"backup": backup, "primary": primary_controller}
+                    )
+                else:
+                    self.add_result(
+                        "High Availability", f"Controller Connectivity: {backup} → {primary_controller}",
+                        TestStatus.WARN,
+                        f"Backup cannot SSH to primary (may be expected if SSH not configured)",
+                        {"backup": backup, "primary": primary_controller, "error": stderr}
+                    )
+    
+    def check_accounting_ha(self):
+        """Check High Availability configuration for Slurm accounting database"""
+        # Only test HA if we have multiple accounting nodes
+        if not self.accounting_nodes or len(self.accounting_nodes) < 2:
+            self.add_result(
+                "High Availability", "Accounting HA Configuration",
+                TestStatus.SKIP,
+                f"Single accounting node setup ({len(self.accounting_nodes)} node), HA not applicable",
+                {"accounting_node_count": len(self.accounting_nodes)}
+            )
+            return
+        
+        # Check which accounting nodes have slurmdbd active
+        active_nodes = []
+        inactive_nodes = []
+        
+        for node in self.accounting_nodes:
+            returncode, stdout, stderr = self.run_ssh_command(
+                node,
+                ['systemctl', 'is-active', 'slurmdbd.service']
+            )
+            
+            if stdout.strip() == 'active':
+                active_nodes.append(node)
+            else:
+                inactive_nodes.append(node)
+        
+        # In a proper HA setup, typically only one slurmdbd should be active at a time
+        # The backup should be ready but not running, or running in standby mode
+        issues = []
+        
+        if len(active_nodes) == 0:
+            issues.append("No active slurmdbd service found")
+            status = TestStatus.FAIL
+        elif len(active_nodes) > 1:
+            # Multiple active slurmdbd instances - check if this is expected
+            # Some setups use active-active with shared storage, others use active-passive
+            issues.append(f"Multiple active slurmdbd instances: {', '.join(active_nodes)}")
+            status = TestStatus.WARN
+            message = f"Multiple slurmdbd active (verify if this is intended for your HA setup)"
+        else:
+            # Exactly one active - this is typical for active-passive HA
+            status = TestStatus.PASS
+            message = f"Accounting HA healthy: active={active_nodes[0]}, standby={', '.join(inactive_nodes)}"
+        
+        # Check database connectivity from each accounting node
+        db_reachable = []
+        db_unreachable = []
+        
+        for node in self.accounting_nodes:
+            # Try to connect to slurmdbd from this node
+            returncode, stdout, stderr = self.run_ssh_command(
+                node,
+                ['sacctmgr', 'show', 'cluster', '-n'],
+                timeout=10
+            )
+            
+            if returncode == 0 and stdout.strip():
+                db_reachable.append(node)
+            else:
+                db_unreachable.append(node)
+        
+        if not issues:
+            self.add_result(
+                "High Availability", "Accounting HA Status",
+                status,
+                message,
+                {
+                    "active_nodes": active_nodes,
+                    "inactive_nodes": inactive_nodes,
+                    "db_reachable_from": db_reachable,
+                    "issues": issues
+                }
+            )
+        else:
+            self.add_result(
+                "High Availability", "Accounting HA Status",
+                status,
+                f"HA issues: {'; '.join(issues)}",
+                {
+                    "active_nodes": active_nodes,
+                    "inactive_nodes": inactive_nodes,
+                    "db_reachable_from": db_reachable,
+                    "issues": issues
+                }
+            )
+        
+        # Check MySQL/MariaDB replication if multiple accounting nodes exist
+        if len(self.accounting_nodes) >= 2:
+            self._check_db_replication()
+    
+    def _check_db_replication(self):
+        """Check MySQL/MariaDB replication status between accounting nodes"""
+        # This checks if database replication is configured and healthy
+        # Note: This assumes standard MySQL/MariaDB replication setup
+        
+        for node in self.accounting_nodes:
+            # Check replication status
+            # Try to get SHOW SLAVE STATUS (MySQL) or SHOW REPLICA STATUS (MariaDB 10.5+)
+            returncode, stdout, stderr = self.run_ssh_command(
+                node,
+                ['mysql', '-e', 'SHOW SLAVE STATUS\\G'],
+                timeout=10
+            )
+            
+            # If SHOW SLAVE STATUS doesn't work, try SHOW REPLICA STATUS
+            if returncode != 0 or not stdout.strip():
+                returncode, stdout, stderr = self.run_ssh_command(
+                    node,
+                    ['mysql', '-e', 'SHOW REPLICA STATUS\\G'],
+                    timeout=10
+                )
+            
+            if returncode != 0:
+                # No replication configured or can't access MySQL
+                self.add_result(
+                    "High Availability", f"DB Replication on {node}",
+                    TestStatus.SKIP,
+                    f"Unable to check replication status (may not be configured)",
+                    {"node": node}
+                )
+                continue
+            
+            if not stdout.strip() or 'Empty set' in stdout:
+                # No replication configured on this node (might be the primary)
+                self.add_result(
+                    "High Availability", f"DB Replication on {node}",
+                    TestStatus.SKIP,
+                    f"No replication configured (may be primary node)",
+                    {"node": node}
+                )
+                continue
+            
+            # Parse replication status
+            slave_io_running = None
+            slave_sql_running = None
+            seconds_behind_master = None
+            last_error = None
+            
+            for line in stdout.split('\n'):
+                line = line.strip()
+                if 'Slave_IO_Running:' in line or 'Replica_IO_Running:' in line:
+                    slave_io_running = line.split(':')[1].strip()
+                elif 'Slave_SQL_Running:' in line or 'Replica_SQL_Running:' in line:
+                    slave_sql_running = line.split(':')[1].strip()
+                elif 'Seconds_Behind_Master:' in line or 'Seconds_Behind_Source:' in line:
+                    value = line.split(':')[1].strip()
+                    if value and value != 'NULL':
+                        try:
+                            seconds_behind_master = int(value)
+                        except ValueError:
+                            pass
+                elif 'Last_Error:' in line:
+                    last_error = line.split(':', 1)[1].strip() if ':' in line else None
+            
+            # Evaluate replication health
+            issues = []
+            if slave_io_running != 'Yes':
+                issues.append(f"IO thread not running: {slave_io_running}")
+            if slave_sql_running != 'Yes':
+                issues.append(f"SQL thread not running: {slave_sql_running}")
+            if seconds_behind_master is not None and seconds_behind_master > 60:
+                issues.append(f"Replication lag: {seconds_behind_master}s")
+            if last_error and last_error.strip():
+                issues.append(f"Error: {last_error[:100]}")
+            
+            if issues:
+                status = TestStatus.FAIL
+                message = f"Replication issues: {'; '.join(issues)}"
+            else:
+                status = TestStatus.PASS
+                lag_info = f", lag: {seconds_behind_master}s" if seconds_behind_master is not None else ""
+                message = f"Replication healthy (IO: {slave_io_running}, SQL: {slave_sql_running}{lag_info})"
+            
+            self.add_result(
+                "High Availability", f"DB Replication on {node}",
+                status,
+                message,
+                {
+                    "node": node,
+                    "io_running": slave_io_running,
+                    "sql_running": slave_sql_running,
+                    "seconds_behind": seconds_behind_master,
+                    "issues": issues
+                }
+            )
+    
     def check_nodes(self) -> Dict[str, Any]:
         """Check compute node status"""
         returncode, stdout, stderr = self.run_command(['sinfo', '-N', '-h', '-o', '%N|%T|%E'])
@@ -1550,6 +1863,8 @@ class SlurmHealthcheck:
         """Run all healthcheck tests"""
         self.check_slurm_version()
         self.check_services()
+        self.check_controller_ha()
+        self.check_accounting_ha()
         self.check_nodes()
         self.check_slurmdbd_connection()
         self.check_job_history()
