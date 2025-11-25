@@ -1079,15 +1079,10 @@ class SlurmHealthcheck:
             
             if mysql_on_node:
                 # Try with slurm credentials via SSH (force TCP with -h to avoid socket issues)
-                mysql_cmd_ssh = [
-                    'mysql',
-                    '-h', node,  # Force TCP connection
-                    '-u', db_config['storage_user'],
-                    f'-p{db_config["storage_pass"]}',
-                    '-e', 'SHOW SLAVE STATUS\\G'
-                ]
+                # Need to use shell command string for proper quoting through SSH
+                mysql_cmd_str = f'mysql -h {node} -u {db_config["storage_user"]} -p{db_config["storage_pass"]} -e "SHOW SLAVE STATUS\\G"'
                 
-                returncode, stdout, stderr = self.run_ssh_command(node, mysql_cmd_ssh, timeout=10)
+                returncode, stdout, stderr = self.run_ssh_command(node, ['sh', '-c', mysql_cmd_str], timeout=10)
                 
                 # Filter out password warning from stderr for cleaner error messages
                 stderr_filtered = '\n'.join([line for line in stderr.split('\n') 
@@ -1095,8 +1090,8 @@ class SlurmHealthcheck:
                 
                 # If SHOW SLAVE STATUS doesn't work, try SHOW REPLICA STATUS (MariaDB 10.5+)
                 if returncode != 0 or not stdout.strip():
-                    mysql_cmd_ssh[-1] = 'SHOW REPLICA STATUS\\G'
-                    returncode, stdout, stderr = self.run_ssh_command(node, mysql_cmd_ssh, timeout=10)
+                    mysql_cmd_str = f'mysql -h {node} -u {db_config["storage_user"]} -p{db_config["storage_pass"]} -e "SHOW REPLICA STATUS\\G"'
+                    returncode, stdout, stderr = self.run_ssh_command(node, ['sh', '-c', mysql_cmd_str], timeout=10)
                     stderr_filtered = '\n'.join([line for line in stderr.split('\n') 
                                                 if 'password on the command line' not in line.lower()])
                 
@@ -1105,35 +1100,29 @@ class SlurmHealthcheck:
                     # Try connecting as MySQL root (Linux root user via socket auth)
                     # Try common socket locations
                     for socket_path in ['/var/lib/mysql/mysql.sock', '/var/run/mysqld/mysqld.sock', '/tmp/mysql.sock']:
-                        mysql_cmd_root = ['mysql', f'--socket={socket_path}', '-e', 'SHOW SLAVE STATUS\\G']
-                        returncode, stdout, stderr = self.run_ssh_command(node, mysql_cmd_root, timeout=10)
+                        mysql_cmd_str = f'mysql --socket={socket_path} -e "SHOW SLAVE STATUS\\G"'
+                        returncode, stdout, stderr = self.run_ssh_command(node, ['sh', '-c', mysql_cmd_str], timeout=10)
                         
                         if returncode == 0:
                             break  # Found working socket
                         
                         # Try SHOW REPLICA STATUS as well
                         if returncode != 0 or not stdout.strip():
-                            mysql_cmd_root[-1] = 'SHOW REPLICA STATUS\\G'
-                            returncode, stdout, stderr = self.run_ssh_command(node, mysql_cmd_root, timeout=10)
+                            mysql_cmd_str = f'mysql --socket={socket_path} -e "SHOW REPLICA STATUS\\G"'
+                            returncode, stdout, stderr = self.run_ssh_command(node, ['sh', '-c', mysql_cmd_str], timeout=10)
                             if returncode == 0:
                                 break
             else:
                 # MySQL not on node, try from BCM head node
-                mysql_cmd_remote = [
-                    'mysql',
-                    '-h', node,
-                    '-u', db_config['storage_user'],
-                    f'-p{db_config["storage_pass"]}',
-                    '-e', 'SHOW SLAVE STATUS\\G'
-                ]
+                mysql_cmd_str = f'mysql -h {node} -u {db_config["storage_user"]} -p{db_config["storage_pass"]} -e "SHOW SLAVE STATUS\\G"'
                 
-                returncode, stdout, stderr = self.run_command(mysql_cmd_remote, timeout=10)
+                returncode, stdout, stderr = self.run_command(['sh', '-c', mysql_cmd_str], timeout=10)
                 stderr_filtered = '\n'.join([line for line in stderr.split('\n') 
                                             if 'password on the command line' not in line.lower()])
                 
                 if returncode != 0 or not stdout.strip():
-                    mysql_cmd_remote[-1] = 'SHOW REPLICA STATUS\\G'
-                    returncode, stdout, stderr = self.run_command(mysql_cmd_remote, timeout=10)
+                    mysql_cmd_str = f'mysql -h {node} -u {db_config["storage_user"]} -p{db_config["storage_pass"]} -e "SHOW REPLICA STATUS\\G"'
+                    returncode, stdout, stderr = self.run_command(['sh', '-c', mysql_cmd_str], timeout=10)
                     stderr_filtered = '\n'.join([line for line in stderr.split('\n') 
                                                 if 'password on the command line' not in line.lower()])
             
