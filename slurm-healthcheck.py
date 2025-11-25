@@ -1042,49 +1042,65 @@ class SlurmHealthcheck:
             return {}
     
     def _check_db_replication(self):
-        """Check MySQL/MariaDB replication status between accounting nodes"""
+        """Check MySQL/MariaDB replication status between accounting nodes
+        
+        Note: This check requires the MySQL user to have SUPER or SLAVE MONITOR privileges.
+        If the slurm user doesn't have these privileges, the check will be skipped.
+        """
         # This checks if database replication is configured and healthy
         # Note: This assumes standard MySQL/MariaDB replication setup
         
         # Get database credentials from slurmdbd.conf
         db_config = self._parse_slurmdbd_conf()
         
-        # Build mysql command with credentials
-        mysql_cmd = ['mysql']
-        if db_config.get('storage_host'):
-            mysql_cmd.extend(['-h', db_config['storage_host']])
-        if db_config.get('storage_user'):
-            mysql_cmd.extend(['-u', db_config['storage_user']])
-        if db_config.get('storage_pass'):
-            mysql_cmd.extend([f'-p{db_config["storage_pass"]}'])
-        
-        for node in self.accounting_nodes:
-            # Check replication status
-            # Try to get SHOW SLAVE STATUS (MySQL) or SHOW REPLICA STATUS (MariaDB 10.5+)
-            cmd = mysql_cmd + ['-e', 'SHOW SLAVE STATUS\\G']
-            returncode, stdout, stderr = self.run_ssh_command(
-                node,
-                cmd,
-                timeout=10
-            )
-            
-            # If SHOW SLAVE STATUS doesn't work, try SHOW REPLICA STATUS
-            if returncode != 0 or not stdout.strip():
-                cmd = mysql_cmd + ['-e', 'SHOW REPLICA STATUS\\G']
-                returncode, stdout, stderr = self.run_ssh_command(
-                    node,
-                    cmd,
-                    timeout=10
-                )
-            
-            if returncode != 0:
-                # No replication configured or can't access MySQL
+        if not db_config.get('storage_user') or not db_config.get('storage_pass'):
+            # Can't check replication without credentials
+            for node in self.accounting_nodes:
                 self.add_result(
                     "High Availability", f"DB Replication on {node}",
                     TestStatus.SKIP,
-                    f"Unable to check replication status (may not be configured)",
+                    "Unable to read database credentials from slurmdbd.conf",
                     {"node": node}
                 )
+            return
+        
+        # Run mysql commands from local BCM head node, connecting remotely to each accounting node
+        for node in self.accounting_nodes:
+            # Build mysql command with credentials - connect to this specific node's database
+            mysql_cmd = [
+                'mysql',
+                '-h', node,
+                '-u', db_config['storage_user'],
+                f'-p{db_config["storage_pass"]}',
+                '-e', 'SHOW SLAVE STATUS\\G'
+            ]
+            
+            # Check replication status
+            # Try to get SHOW SLAVE STATUS (MySQL) or SHOW REPLICA STATUS (MariaDB 10.5+)
+            returncode, stdout, stderr = self.run_command(mysql_cmd, timeout=10)
+            
+            # If SHOW SLAVE STATUS doesn't work, try SHOW REPLICA STATUS
+            if returncode != 0 or not stdout.strip():
+                mysql_cmd[-1] = 'SHOW REPLICA STATUS\\G'
+                returncode, stdout, stderr = self.run_command(mysql_cmd, timeout=10)
+            
+            if returncode != 0:
+                # Check if it's a permission error
+                if 'Access denied' in stderr or 'SUPER' in stderr or 'SLAVE MONITOR' in stderr:
+                    self.add_result(
+                        "High Availability", f"DB Replication on {node}",
+                        TestStatus.SKIP,
+                        f"Insufficient MySQL privileges to check replication (need SUPER or SLAVE MONITOR)",
+                        {"node": node, "error": "permission_denied"}
+                    )
+                else:
+                    # No replication configured or can't access MySQL
+                    self.add_result(
+                        "High Availability", f"DB Replication on {node}",
+                        TestStatus.SKIP,
+                        f"Unable to check replication status (may not be configured)",
+                        {"node": node, "error": stderr.strip()[:100] if stderr else "unknown"}
+                    )
                 continue
             
             if not stdout.strip() or 'Empty set' in stdout:
