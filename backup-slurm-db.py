@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Slurm Database Backup Script
+Slurm Database Backup and Restore Script
 
-Creates a compressed backup of the Slurm accounting database (slurmdbd).
-Reads database credentials from slurmdbd.conf and creates timestamped backups.
+Creates compressed backups of the Slurm accounting database (slurmdbd) and
+can restore from those backups. Reads database credentials from slurmdbd.conf.
 
 Usage:
+    # Backup operations
     ./backup-slurm-db.py                    # Create backup in default directory
     ./backup-slurm-db.py -o /path/to/dir    # Create backup in specific directory
     ./backup-slurm-db.py --retention 7      # Keep only last 7 days of backups
     ./backup-slurm-db.py --no-compress      # Skip gzip compression
+    
+    # Restore operations
+    ./backup-slurm-db.py --restore FILE     # Restore from backup file
+    ./backup-slurm-db.py --restore FILE -y  # Restore without confirmation prompt
 """
 
 import argparse
@@ -404,23 +409,218 @@ class SlurmDatabaseBackup:
             self.log(f"\n{Colors.YELLOW}⚠ Backup verification had warnings{Colors.RESET}")
         
         return all_passed
+    
+    def restore_backup(self, backup_file: str, force: bool = False) -> bool:
+        """Restore database from a backup file.
+        
+        Reads StorageHost from slurmdbd.conf and restores to that database server.
+        Supports both plain .sql and compressed .sql.gz files.
+        
+        Args:
+            backup_file: Path to the backup file
+            force: If True, skip confirmation prompt
+            
+        Returns:
+            True if restore was successful, False otherwise
+        """
+        # Find and parse slurmdbd.conf
+        self.slurmdbd_conf_path = self.find_slurmdbd_conf()
+        
+        if not self.slurmdbd_conf_path:
+            self.log("ERROR: Could not find slurmdbd.conf", Colors.RED)
+            self.log("Checked common locations in /cm/shared, /cm/local, /etc/slurm", Colors.RED)
+            return False
+        
+        self.log(f"Reading database configuration from: {self.slurmdbd_conf_path}")
+        
+        self.db_config = self.parse_slurmdbd_conf(self.slurmdbd_conf_path)
+        
+        if not self.db_config:
+            self.log("ERROR: Failed to parse slurmdbd.conf", Colors.RED)
+            return False
+        
+        # Validate backup file exists
+        if not os.path.exists(backup_file):
+            self.log(f"ERROR: Backup file not found: {backup_file}", Colors.RED)
+            return False
+        
+        backup_size = os.path.getsize(backup_file)
+        is_compressed = backup_file.endswith('.gz')
+        
+        # Display restore information
+        self.log(f"\n{Colors.BOLD}Restore Configuration:{Colors.RESET}")
+        self.log(f"  Backup file     : {backup_file}")
+        self.log(f"  File size       : {backup_size:,} bytes ({backup_size / (1024*1024):.2f} MB)")
+        self.log(f"  Compressed      : {'Yes (.gz)' if is_compressed else 'No (plain SQL)'}")
+        self.log(f"  Target host     : {self.db_config['storage_host']}")
+        self.log(f"  Target database : {self.db_config['storage_loc']}")
+        self.log(f"  Database user   : {self.db_config['storage_user']}")
+        self.log(f"  Config source   : {self.slurmdbd_conf_path}")
+        
+        # Verify backup first
+        self.log(f"\n{Colors.BOLD}Pre-restore verification...{Colors.RESET}")
+        
+        if is_compressed:
+            # Test gzip integrity
+            result = subprocess.run(
+                ['gzip', '-t', backup_file],
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode != 0:
+                self.log(f"ERROR: Backup file is corrupted: {result.stderr}", Colors.RED)
+                return False
+            
+            self.log(f"  {Colors.GREEN}✓{Colors.RESET} Gzip integrity check passed")
+        
+        # Confirmation prompt
+        if not force:
+            self.log(f"\n{Colors.YELLOW}{Colors.BOLD}WARNING:{Colors.RESET}")
+            self.log(f"{Colors.YELLOW}This will REPLACE the contents of database '{self.db_config['storage_loc']}'")
+            self.log(f"on host '{self.db_config['storage_host']}' with the backup data.{Colors.RESET}")
+            self.log(f"{Colors.YELLOW}Any existing data in that database will be LOST.{Colors.RESET}\n")
+            
+            answer = input("Are you sure you want to proceed? [y/N]: ").strip().lower()
+            if answer not in ('y', 'yes'):
+                self.log("\nRestore cancelled by user.")
+                return False
+        
+        # Build mysql command
+        mysql_cmd = [
+            'mysql',
+            f"--host={self.db_config['storage_host']}",
+            f"--port={self.db_config['storage_port']}",
+            f"--user={self.db_config['storage_user']}",
+            '--default-character-set=utf8mb4',
+        ]
+        
+        if self.db_config['storage_pass']:
+            mysql_cmd.append(f"--password={self.db_config['storage_pass']}")
+        
+        # Create database if it doesn't exist
+        self.log(f"\n{Colors.BOLD}Ensuring database exists...{Colors.RESET}")
+        
+        create_db_cmd = mysql_cmd + [
+            '-e',
+            f"CREATE DATABASE IF NOT EXISTS `{self.db_config['storage_loc']}` "
+            f"DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        ]
+        
+        result = subprocess.run(
+            create_db_cmd,
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            # Filter out password warning
+            stderr = '\n'.join([l for l in result.stderr.split('\n') 
+                               if 'password on the command line' not in l.lower()])
+            if stderr.strip():
+                self.log(f"ERROR: Could not create database: {stderr}", Colors.RED)
+                return False
+        
+        self.log(f"  {Colors.GREEN}✓{Colors.RESET} Database exists or created")
+        
+        # Perform restore
+        self.log(f"\n{Colors.BOLD}Restoring database... (this may take a while){Colors.RESET}")
+        
+        restore_cmd = mysql_cmd + [self.db_config['storage_loc']]
+        
+        try:
+            if is_compressed:
+                # Decompress and pipe to mysql
+                zcat_process = subprocess.Popen(
+                    ['zcat', backup_file],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                
+                mysql_process = subprocess.Popen(
+                    restore_cmd,
+                    stdin=zcat_process.stdout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                
+                zcat_process.stdout.close()
+                mysql_stdout, mysql_stderr = mysql_process.communicate()
+                zcat_process.wait()
+                
+                if zcat_process.returncode != 0:
+                    self.log("ERROR: Failed to decompress backup file", Colors.RED)
+                    return False
+                
+                if mysql_process.returncode != 0:
+                    # Filter out password warning
+                    stderr = '\n'.join([l for l in mysql_stderr.split('\n') 
+                                       if 'password on the command line' not in l.lower()])
+                    if stderr.strip():
+                        self.log(f"ERROR: MySQL restore failed: {stderr}", Colors.RED)
+                        return False
+            else:
+                # Plain SQL file
+                with open(backup_file, 'r') as f:
+                    result = subprocess.run(
+                        restore_cmd,
+                        stdin=f,
+                        capture_output=True,
+                        text=True
+                    )
+                
+                if result.returncode != 0:
+                    # Filter out password warning
+                    stderr = '\n'.join([l for l in result.stderr.split('\n') 
+                                       if 'password on the command line' not in l.lower()])
+                    if stderr.strip():
+                        self.log(f"ERROR: MySQL restore failed: {stderr}", Colors.RED)
+                        return False
+            
+            self.log(f"\n{Colors.GREEN}{Colors.BOLD}✓ Database restored successfully!{Colors.RESET}")
+            self.log(f"  Database: {self.db_config['storage_loc']}")
+            self.log(f"  Host: {self.db_config['storage_host']}")
+            
+            # Post-restore advice
+            self.log(f"\n{Colors.BOLD}Post-restore steps:{Colors.RESET}")
+            self.log("  1. Restart slurmdbd service: systemctl restart slurmdbd")
+            self.log("  2. Verify with: sacctmgr show cluster")
+            self.log("  3. Check accounting: sacctmgr show account")
+            
+            return True
+        
+        except Exception as e:
+            self.log(f"ERROR: Restore failed: {e}", Colors.RED)
+            return False
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Backup Slurm accounting database',
+        description='Backup and restore Slurm accounting database',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Backup operations
   %(prog)s                          # Create compressed backup in default location
   %(prog)s -o /backup/slurm         # Backup to specific directory
   %(prog)s --retention 7            # Keep only last 7 days of backups
   %(prog)s --no-compress            # Create uncompressed backup
   %(prog)s -v                       # Verbose output
   %(prog)s --verify-only FILE       # Just verify an existing backup
+  
+  # Restore operations
+  %(prog)s --restore backup.sql.gz  # Restore from backup file (with confirmation)
+  %(prog)s --restore backup.sql -y  # Restore without confirmation prompt
+
+Notes:
+  - Both backup and restore use the StorageHost from slurmdbd.conf
+  - No need to specify which server - it's determined from the config
+  - Supports both .sql and .sql.gz backup files
         """
     )
     
+    # Backup arguments
     parser.add_argument('-o', '--output-dir', type=str,
                         help='Output directory for backup (default: auto-detect)')
     parser.add_argument('--no-compress', action='store_true',
@@ -431,6 +631,12 @@ Examples:
                         help='Verbose output')
     parser.add_argument('--verify-only', type=str, metavar='FILE',
                         help='Only verify an existing backup file')
+    
+    # Restore arguments
+    parser.add_argument('--restore', type=str, metavar='FILE',
+                        help='Restore database from backup file')
+    parser.add_argument('-y', '--yes', action='store_true',
+                        help='Skip confirmation prompt (use with --restore)')
     
     args = parser.parse_args()
     
@@ -453,6 +659,26 @@ Examples:
         
         success = backup.verify_backup(args.verify_only)
         sys.exit(0 if success else 1)
+    
+    # Restore mode
+    if args.restore:
+        if not os.path.exists(args.restore):
+            print(f"{Colors.RED}ERROR: Backup file not found: {args.restore}{Colors.RESET}")
+            sys.exit(1)
+        
+        print(f"{Colors.BOLD}{'=' * 65}")
+        print("SLURM DATABASE RESTORE")
+        print('=' * 65 + Colors.RESET)
+        print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        
+        success = backup.restore_backup(args.restore, force=args.yes)
+        
+        if success:
+            print(f"\n{Colors.BOLD}{'=' * 65}{Colors.RESET}")
+            sys.exit(0)
+        else:
+            print(f"\n{Colors.RED}{Colors.BOLD}✗ Restore failed!{Colors.RESET}")
+            sys.exit(1)
     
     # Create backup
     print(f"{Colors.BOLD}{'=' * 65}")
