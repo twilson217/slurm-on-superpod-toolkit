@@ -848,6 +848,23 @@ class SlurmHealthcheck:
             )
             return
         
+        # Get primary and backup designation from slurm.conf
+        returncode, stdout, stderr = self.run_command(['scontrol', 'show', 'config'], timeout=10)
+        primary_host = None
+        backup_host = None
+        
+        if returncode == 0:
+            for line in stdout.split('\n'):
+                line = line.strip()
+                if 'AccountingStorageHost' in line and 'Backup' not in line:
+                    match = re.search(r'AccountingStorageHost\s*=\s*(\S+)', line)
+                    if match:
+                        primary_host = match.group(1)
+                elif 'AccountingStorageBackupHost' in line:
+                    match = re.search(r'AccountingStorageBackupHost\s*=\s*(\S+)', line)
+                    if match:
+                        backup_host = match.group(1)
+        
         # Check which accounting nodes have slurmdbd active
         active_nodes = []
         inactive_nodes = []
@@ -863,70 +880,119 @@ class SlurmHealthcheck:
             else:
                 inactive_nodes.append(node)
         
-        # In a proper HA setup, configurations vary:
-        # - Active-passive: only one slurmdbd active, others on standby
-        # - Active-active: multiple slurmdbd instances with shared storage
+        # Validate HA configuration
         issues = []
         
         if len(active_nodes) == 0:
             issues.append("No active slurmdbd service found")
             status = TestStatus.FAIL
-            message = "No active slurmdbd service"
-        elif len(active_nodes) > 1:
-            # Multiple active slurmdbd instances - could be active-active HA or both primaries
-            # This is not necessarily an error, so we'll report it as info
-            status = TestStatus.PASS
-            message = f"Multiple slurmdbd active: {', '.join(active_nodes)} (active-active HA or transitioning state)"
         else:
-            # Exactly one active - this is typical for active-passive HA
-            status = TestStatus.PASS
-            message = f"Accounting HA: active={active_nodes[0]}, standby={', '.join(inactive_nodes) if inactive_nodes else 'none'}"
-        
-        # Check database connectivity from each accounting node
-        db_reachable = []
-        db_unreachable = []
-        
-        for node in self.accounting_nodes:
-            # Try to connect to slurmdbd from this node
-            returncode, stdout, stderr = self.run_ssh_command(
-                node,
-                ['sacctmgr', 'show', 'cluster', '-n'],
-                timeout=10
-            )
+            # Check if primary is running
+            if primary_host and primary_host not in active_nodes:
+                issues.append(f"Primary slurmdbd ({primary_host}) is not active")
             
-            if returncode == 0 and stdout.strip():
-                db_reachable.append(node)
+            # Check if backup is running (expected in HA setup)
+            if backup_host and backup_host not in active_nodes:
+                issues.append(f"Backup slurmdbd ({backup_host}) is not active")
+            
+            # In Slurm HA, both primary and backup slurmdbd should be running
+            # The backup connects to primary for state sync
+            if primary_host and backup_host:
+                if primary_host in active_nodes and backup_host in active_nodes:
+                    # Check active connections to verify which is serving requests
+                    self._check_slurmdbd_connections(primary_host, backup_host)
+                    status = TestStatus.PASS
+                    message = f"Accounting HA: primary={primary_host}, backup={backup_host}, both active"
+                elif primary_host in active_nodes:
+                    status = TestStatus.WARN
+                    message = f"Primary slurmdbd active but backup is down: primary={primary_host}"
+                else:
+                    status = TestStatus.FAIL
+                    message = f"Primary slurmdbd is down"
             else:
-                db_unreachable.append(node)
+                status = TestStatus.WARN
+                message = f"Could not determine primary/backup from slurm.conf"
         
-        if not issues:
-            self.add_result(
-                "High Availability", "Accounting HA Status",
-                status,
-                message,
-                {
-                    "active_nodes": active_nodes,
-                    "inactive_nodes": inactive_nodes,
-                    "db_reachable_from": db_reachable,
-                    "issues": issues
-                }
-            )
-        else:
-            self.add_result(
-                "High Availability", "Accounting HA Status",
-                status,
-                f"HA issues: {'; '.join(issues)}",
-                {
-                    "active_nodes": active_nodes,
-                    "inactive_nodes": inactive_nodes,
-                    "db_reachable_from": db_reachable,
-                    "issues": issues
-                }
-            )
+        if issues:
+            status = TestStatus.FAIL
+            message = f"HA issues: {'; '.join(issues)}"
+        
+        self.add_result(
+            "High Availability", "Accounting HA Status",
+            status,
+            message,
+            {
+                "primary_host": primary_host,
+                "backup_host": backup_host,
+                "active_nodes": active_nodes,
+                "inactive_nodes": inactive_nodes,
+                "issues": issues
+            }
+        )
         
         # Check MySQL/MariaDB replication if multiple accounting nodes exist
         if len(self.accounting_nodes) >= 2:
             self._check_db_replication()
+    
+    def _check_slurmdbd_connections(self, primary_host: str, backup_host: str):
+        """Check active connections to slurmdbd to verify primary/backup relationship"""
+        # Check connections on primary slurmdbd (port 6819)
+        returncode, stdout, stderr = self.run_ssh_command(
+            primary_host,
+            ['ss', '-tnp', '2>/dev/null', '|', 'grep', ':6819', '|', 'grep', 'ESTAB'],
+            timeout=10
+        )
+        
+        # Parse connections
+        slurmctld_connected = False
+        backup_connected = False
+        
+        for line in stdout.split('\n'):
+            if 'slurmctld' in line:
+                slurmctld_connected = True
+            # Check if backup host IP is in the connection (simplified check)
+            # In a proper implementation, we'd resolve hostnames to IPs
+        
+        # Check connections on backup slurmdbd
+        returncode_backup, stdout_backup, stderr_backup = self.run_ssh_command(
+            backup_host,
+            ['ss', '-tnp', '2>/dev/null', '|', 'grep', ':6819', '|', 'grep', 'ESTAB'],
+            timeout=10
+        )
+        
+        # Check if backup is connecting TO primary (for state sync)
+        backup_to_primary = 'slurmdbd' in stdout_backup
+        
+        # Report connection status
+        if slurmctld_connected:
+            self.add_result(
+                "High Availability", "Accounting Primary Connection",
+                TestStatus.PASS,
+                f"slurmctld connected to primary slurmdbd ({primary_host})",
+                {"primary_host": primary_host, "connections": stdout.count('ESTAB')}
+            )
+        else:
+            self.add_result(
+                "High Availability", "Accounting Primary Connection",
+                TestStatus.WARN,
+                f"Could not verify slurmctld connection to primary ({primary_host})",
+                {"primary_host": primary_host}
+            )
+        
+        if backup_to_primary:
+            self.add_result(
+                "High Availability", "Accounting Backup Sync",
+                TestStatus.PASS,
+                f"Backup slurmdbd ({backup_host}) connected to primary for state sync",
+                {"backup_host": backup_host, "primary_host": primary_host}
+            )
+        else:
+            self.add_result(
+                "High Availability", "Accounting Backup Sync",
+                TestStatus.WARN,
+                f"Could not verify backup ({backup_host}) connection to primary",
+                {"backup_host": backup_host}
+            )
     
     def _parse_slurmdbd_conf(self) -> dict:
         """Parse slurmdbd.conf to extract database configuration"""
