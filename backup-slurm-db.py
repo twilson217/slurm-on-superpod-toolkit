@@ -427,7 +427,7 @@ class SlurmDatabaseBackup:
         cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
         
         if not os.path.exists(cmsh_path):
-            self.vlog("  cmsh not found, cannot discover slurmdbd nodes")
+            self.log("  cmsh not found, cannot discover slurmdbd nodes")
             return nodes
         
         try:
@@ -440,7 +440,7 @@ class SlurmDatabaseBackup:
             )
             
             if result.returncode != 0 or not result.stdout.strip():
-                self.vlog(f"  Could not find overlay with slurmaccounting role")
+                self.log(f"  Could not find overlay with slurmaccounting role")
                 return nodes
             
             overlay_name = result.stdout.strip().split('\n')[0].strip()
@@ -455,7 +455,7 @@ class SlurmDatabaseBackup:
             )
             
             if result.returncode != 0:
-                self.vlog(f"  Could not query overlay settings: {result.stderr}")
+                self.log(f"  Could not query overlay settings: {result.stderr}")
                 return nodes
             
             lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
