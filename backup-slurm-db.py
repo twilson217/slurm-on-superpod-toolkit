@@ -529,164 +529,143 @@ class SlurmDatabaseBackup:
         # Perform restore with progress feedback
         self.log(f"\n{Colors.BOLD}Restoring database...{Colors.RESET}")
         self.log(f"  Source file: {backup_size:,} bytes ({backup_size / 1024 / 1024:.1f} MB)")
-        if is_compressed:
-            # Estimate uncompressed size (typical SQL compression ratio is ~10-15x)
-            est_uncompressed = backup_size * 12
-            self.log(f"  Estimated uncompressed: ~{est_uncompressed / 1024 / 1024:.0f} MB")
         self.log("")
         
         restore_cmd = mysql_cmd + [self.db_config['storage_loc']]
         
         try:
-            # Progress tracking variables
-            bytes_processed = [0]
-            statements_count = [0]
             start_time = time.time()
-            restore_complete = [False]
-            restore_error = [None]
             
-            def format_time(seconds):
-                """Format seconds as MM:SS or HH:MM:SS"""
-                if seconds < 3600:
-                    return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
+            # Check if pv (pipe viewer) is available for progress display
+            pv_available = subprocess.run(
+                ['which', 'pv'], 
+                capture_output=True
+            ).returncode == 0
+            
+            if pv_available:
+                # Use pv for nice progress display
+                # pv shows: bytes transferred, time elapsed, rate, ETA
+                if is_compressed:
+                    # zcat file.gz | pv | mysql ...
+                    # Use shell pipeline for simplicity
+                    shell_cmd = (
+                        f"zcat '{backup_file}' | pv -f -N 'Importing' | "
+                        f"mysql -h {self.db_config['storage_host']} "
+                        f"-u {self.db_config['storage_user']} "
+                        f"-p'{self.db_config['storage_pass']}' "
+                        f"{self.db_config['storage_loc']}"
+                    )
                 else:
-                    hours = int(seconds // 3600)
-                    minutes = int((seconds % 3600) // 60)
-                    secs = int(seconds % 60)
-                    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-            
-            def progress_reporter():
-                """Background thread to report progress"""
-                spinner = ['|', '/', '-', '\\']
-                spin_idx = 0
-                last_bytes = 0
+                    # pv file.sql | mysql ...
+                    shell_cmd = (
+                        f"pv -f -N 'Importing' '{backup_file}' | "
+                        f"mysql -h {self.db_config['storage_host']} "
+                        f"-u {self.db_config['storage_user']} "
+                        f"-p'{self.db_config['storage_pass']}' "
+                        f"{self.db_config['storage_loc']}"
+                    )
                 
-                while not restore_complete[0]:
-                    elapsed = time.time() - start_time
-                    current_bytes = bytes_processed[0]
-                    
-                    # Calculate rate
-                    rate_mbps = (current_bytes - last_bytes) / 1024 / 1024 if elapsed > 0 else 0
-                    total_mb = current_bytes / 1024 / 1024
-                    
-                    # Progress bar based on bytes (for compressed, this is uncompressed bytes)
-                    if is_compressed and est_uncompressed > 0:
-                        pct = min(100, (current_bytes / est_uncompressed) * 100)
-                        bar_len = 30
-                        filled = int(bar_len * pct / 100)
-                        bar = '█' * filled + '░' * (bar_len - filled)
-                        status = f"\r  {spinner[spin_idx]} [{bar}] {pct:5.1f}% | {total_mb:,.1f} MB | {format_time(elapsed)} elapsed"
-                    else:
-                        status = f"\r  {spinner[spin_idx]} Processing... {total_mb:,.1f} MB | {format_time(elapsed)} elapsed"
-                    
-                    # Print status (overwrite line)
-                    sys.stdout.write(status)
-                    sys.stdout.flush()
-                    
-                    spin_idx = (spin_idx + 1) % 4
-                    last_bytes = current_bytes
-                    time.sleep(0.5)
-                
-                # Final newline
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-            
-            def stream_to_mysql(input_stream, mysql_stdin):
-                """Read from input stream and write to MySQL stdin, tracking bytes"""
-                try:
-                    chunk_size = 64 * 1024  # 64KB chunks
-                    while True:
-                        chunk = input_stream.read(chunk_size)
-                        if not chunk:
-                            break
-                        if isinstance(chunk, str):
-                            chunk = chunk.encode('utf-8')
-                        mysql_stdin.write(chunk)
-                        bytes_processed[0] += len(chunk)
-                    mysql_stdin.close()
-                except Exception as e:
-                    restore_error[0] = str(e)
-            
-            # Start progress reporter thread
-            progress_thread = threading.Thread(target=progress_reporter, daemon=True)
-            progress_thread.start()
-            
-            if is_compressed:
-                # Open gzip file and stream to mysql with progress tracking
-                mysql_process = subprocess.Popen(
-                    restore_cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
+                # Run the pipeline
+                result = subprocess.run(
+                    shell_cmd,
+                    shell=True,
+                    stderr=subprocess.PIPE,
+                    text=True
                 )
                 
-                # Stream decompressed data to MySQL
-                with gzip.open(backup_file, 'rb') as gz_file:
-                    stream_thread = threading.Thread(
-                        target=stream_to_mysql,
-                        args=(gz_file, mysql_process.stdin),
-                        daemon=True
-                    )
-                    stream_thread.start()
-                    
-                    # Wait for MySQL to finish
-                    mysql_stdout, mysql_stderr = mysql_process.communicate()
-                    stream_thread.join(timeout=5)
-                
-                restore_complete[0] = True
-                progress_thread.join(timeout=2)
-                
-                if restore_error[0]:
-                    self.log(f"ERROR: Stream error: {restore_error[0]}", Colors.RED)
-                    return False
-                
-                if mysql_process.returncode != 0:
-                    # Filter out password warning
-                    stderr_text = mysql_stderr.decode('utf-8', errors='replace') if isinstance(mysql_stderr, bytes) else mysql_stderr
-                    stderr = '\n'.join([l for l in stderr_text.split('\n') 
-                                       if 'password on the command line' not in l.lower()])
+                if result.returncode != 0:
+                    # Filter out password warning from stderr
+                    stderr = '\n'.join([l for l in result.stderr.split('\n') 
+                                       if 'password on the command line' not in l.lower()
+                                       and 'Importing:' not in l])  # pv output goes to stderr
                     if stderr.strip():
-                        self.log(f"ERROR: MySQL restore failed: {stderr}", Colors.RED)
+                        self.log(f"\nERROR: MySQL restore failed: {stderr}", Colors.RED)
                         return False
             else:
-                # Plain SQL file with progress tracking
-                mysql_process = subprocess.Popen(
-                    restore_cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
+                # Fallback: no pv, use simple approach with elapsed time display
+                self.log("  (Install 'pv' package for better progress display)")
+                self.log("")
                 
-                with open(backup_file, 'rb') as f:
-                    stream_thread = threading.Thread(
-                        target=stream_to_mysql,
-                        args=(f, mysql_process.stdin),
-                        daemon=True
+                # Progress tracking with elapsed time
+                restore_complete = [False]
+                
+                def show_elapsed():
+                    """Show elapsed time while restore runs"""
+                    spinner = ['|', '/', '-', '\\']
+                    spin_idx = 0
+                    while not restore_complete[0]:
+                        elapsed = time.time() - start_time
+                        mins = int(elapsed // 60)
+                        secs = int(elapsed % 60)
+                        sys.stdout.write(f"\r  {spinner[spin_idx]} Importing... {mins:02d}:{secs:02d} elapsed")
+                        sys.stdout.flush()
+                        spin_idx = (spin_idx + 1) % 4
+                        time.sleep(0.5)
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                
+                # Start elapsed time display
+                elapsed_thread = threading.Thread(target=show_elapsed, daemon=True)
+                elapsed_thread.start()
+                
+                if is_compressed:
+                    # Decompress and pipe to mysql
+                    zcat_process = subprocess.Popen(
+                        ['zcat', backup_file],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
                     )
-                    stream_thread.start()
                     
+                    mysql_process = subprocess.Popen(
+                        restore_cmd,
+                        stdin=zcat_process.stdout,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True
+                    )
+                    
+                    zcat_process.stdout.close()
                     mysql_stdout, mysql_stderr = mysql_process.communicate()
-                    stream_thread.join(timeout=5)
-                
-                restore_complete[0] = True
-                progress_thread.join(timeout=2)
-                
-                if restore_error[0]:
-                    self.log(f"ERROR: Stream error: {restore_error[0]}", Colors.RED)
-                    return False
-                
-                if mysql_process.returncode != 0:
-                    stderr_text = mysql_stderr.decode('utf-8', errors='replace') if isinstance(mysql_stderr, bytes) else mysql_stderr
-                    stderr = '\n'.join([l for l in stderr_text.split('\n') 
-                                       if 'password on the command line' not in l.lower()])
-                    if stderr.strip():
-                        self.log(f"ERROR: MySQL restore failed: {stderr}", Colors.RED)
+                    zcat_process.wait()
+                    
+                    restore_complete[0] = True
+                    elapsed_thread.join(timeout=2)
+                    
+                    if zcat_process.returncode != 0:
+                        self.log("ERROR: Failed to decompress backup file", Colors.RED)
                         return False
+                    
+                    if mysql_process.returncode != 0:
+                        stderr = '\n'.join([l for l in mysql_stderr.split('\n') 
+                                           if 'password on the command line' not in l.lower()])
+                        if stderr.strip():
+                            self.log(f"ERROR: MySQL restore failed: {stderr}", Colors.RED)
+                            return False
+                else:
+                    # Plain SQL file
+                    with open(backup_file, 'r') as f:
+                        result = subprocess.run(
+                            restore_cmd,
+                            stdin=f,
+                            capture_output=True,
+                            text=True
+                        )
+                    
+                    restore_complete[0] = True
+                    elapsed_thread.join(timeout=2)
+                    
+                    if result.returncode != 0:
+                        stderr = '\n'.join([l for l in result.stderr.split('\n') 
+                                           if 'password on the command line' not in l.lower()])
+                        if stderr.strip():
+                            self.log(f"ERROR: MySQL restore failed: {stderr}", Colors.RED)
+                            return False
             
             # Show completion stats
             total_time = time.time() - start_time
-            total_mb = bytes_processed[0] / 1024 / 1024
-            self.log(f"  Processed {total_mb:,.1f} MB in {format_time(total_time)}")
+            mins = int(total_time // 60)
+            secs = int(total_time % 60)
+            self.log(f"\n  Completed in {mins:02d}:{secs:02d}")
             
             self.log(f"\n{Colors.GREEN}{Colors.BOLD}✓ Database restored successfully!{Colors.RESET}")
             self.log(f"  Database: {self.db_config['storage_loc']}")
