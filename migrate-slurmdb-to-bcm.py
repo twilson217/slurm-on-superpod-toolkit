@@ -628,9 +628,8 @@ def format_bytes(size: int) -> str:
 def discover_slurmdbd_nodes() -> list:
     """Discover nodes that run slurmdbd based on BCM configuration overlay.
     
-    Checks the configuration overlay with slurmaccounting role:
-    1. If 'all head nodes' is yes, get all head nodes
-    2. Otherwise, get specific nodes assigned to the overlay
+    Parses 'configurationoverlay list' to find the overlay with slurmaccounting role,
+    then gets the nodes or all head nodes from that overlay.
     
     Returns:
         List of node hostnames that should run slurmdbd
@@ -643,22 +642,38 @@ def discover_slurmdbd_nodes() -> list:
         return nodes
     
     try:
-        # First find the overlay name that has the slurmaccounting role
+        # List all overlays - output format:
+        # name  priority  allheadnodes  nodes  categories  roles
         result = subprocess.run(
-            [cmsh_path, '-c', 'configurationoverlay; foreach -r slurmaccounting (get name)'],
+            [cmsh_path, '-c', 'configurationoverlay; list'],
             capture_output=True,
             text=True,
             timeout=30
         )
         
-        if result.returncode != 0 or not result.stdout.strip():
+        if result.returncode != 0:
+            print(f"  Could not list configuration overlays: {result.stderr}")
+            return nodes
+        
+        # Find the overlay with slurmaccounting role
+        overlay_name = None
+        for line in result.stdout.strip().split('\n'):
+            # Skip empty lines and headers
+            if not line.strip() or line.startswith('Name') or line.startswith('-'):
+                continue
+            # Check if this line contains slurmaccounting role (last column)
+            if 'slurmaccounting' in line.lower():
+                # First column is the overlay name
+                overlay_name = line.split()[0]
+                break
+        
+        if not overlay_name:
             print(f"  Could not find overlay with slurmaccounting role")
             return nodes
         
-        overlay_name = result.stdout.strip().split('\n')[0].strip()
         print(f"  Found slurmaccounting overlay: {overlay_name}")
         
-        # Now get the overlay's node settings
+        # Get allheadnodes and nodes settings from this overlay
         result = subprocess.run(
             [cmsh_path, '-c', f'configurationoverlay; use {overlay_name}; get allheadnodes; get nodes'],
             capture_output=True,
@@ -680,11 +695,9 @@ def discover_slurmdbd_nodes() -> list:
                 all_head_nodes = True
             elif line.lower() in ('no', 'false'):
                 pass  # all_head_nodes stays False
-            elif ',' in line or line:
-                # This could be a node list
-                potential_nodes = [n.strip() for n in line.split(',') if n.strip()]
-                if potential_nodes and potential_nodes[0] not in ('yes', 'no', 'true', 'false'):
-                    overlay_nodes = potential_nodes
+            elif line and line.lower() not in ('yes', 'no', 'true', 'false'):
+                # This is a node list
+                overlay_nodes = [n.strip() for n in line.split(',') if n.strip()]
         
         if all_head_nodes:
             # Get all head nodes
