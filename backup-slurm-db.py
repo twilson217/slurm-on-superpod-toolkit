@@ -414,13 +414,13 @@ class SlurmDatabaseBackup:
         return all_passed
     
     def _discover_slurmdbd_nodes(self) -> list:
-        """Discover nodes that run slurmdbd based on BCM configuration overlay.
+        """Discover nodes that run slurmdbd via BCM slurmaccounting role.
         
-        Parses 'configurationoverlay list' to find the overlay with slurmaccounting role,
-        then gets the nodes or all head nodes from that overlay.
+        Uses 'device; foreach -l slurmaccounting' to find devices that have
+        the slurmaccounting role assigned (directly or via overlay).
         
         Returns:
-            List of node hostnames that should run slurmdbd
+            List of node hostnames that run slurmdbd
         """
         nodes = []
         cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
@@ -430,91 +430,54 @@ class SlurmDatabaseBackup:
             return nodes
         
         try:
-            # List all overlays - output format:
-            # name  priority  allheadnodes  nodes  categories  roles
+            # Use foreach -l to find devices with slurmaccounting role (via overlay)
             result = subprocess.run(
-                [cmsh_path, '-c', 'configurationoverlay; list'],
+                [cmsh_path, '-c', 'device; foreach -l slurmaccounting (get hostname)'],
                 capture_output=True,
                 text=True,
                 timeout=30
             )
             
             if result.returncode != 0:
-                self.log(f"  Could not list configuration overlays: {result.stderr}")
+                self.log(f"  Could not query devices with slurmaccounting role: {result.stderr}")
                 return nodes
             
-            # Find the overlay with slurmaccounting role
-            overlay_name = None
             for line in result.stdout.strip().split('\n'):
-                # Skip empty lines and headers
-                if not line.strip() or line.startswith('Name') or line.startswith('-'):
-                    continue
-                # Check if this line contains slurmaccounting role (last column)
-                if 'slurmaccounting' in line.lower():
-                    # First column is the overlay name
-                    overlay_name = line.split()[0]
-                    break
+                line = line.strip()
+                if line:
+                    nodes.append(line)
             
-            if not overlay_name:
-                self.log(f"  Could not find overlay with slurmaccounting role")
-                return nodes
-            
-            self.log(f"  Found slurmaccounting overlay: {overlay_name}")
-            
-            # Get allheadnodes and nodes settings from this overlay
-            result = subprocess.run(
-                [cmsh_path, '-c', f'configurationoverlay; use {overlay_name}; get allheadnodes; get nodes'],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            if result.returncode != 0:
-                self.log(f"  Could not query overlay settings: {result.stderr}")
-                return nodes
-            
-            lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-            
-            all_head_nodes = False
-            overlay_nodes = []
-            
-            for line in lines:
-                if line.lower() in ('yes', 'true'):
-                    all_head_nodes = True
-                elif line.lower() in ('no', 'false'):
-                    pass  # all_head_nodes stays False
-                elif line and line.lower() not in ('yes', 'no', 'true', 'false'):
-                    # Could be comma-separated or one node per line - handle both
-                    for node in line.split(','):
-                        node = node.strip()
-                        if node:
-                            overlay_nodes.append(node)
-            
-            if all_head_nodes:
-                # Get all head nodes
-                self.log(f"  Overlay '{overlay_name}' uses 'all head nodes = yes'")
-                result = subprocess.run(
-                    [cmsh_path, '-c', 'device; foreach -c headnode (get hostname)'],
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                if result.returncode == 0:
-                    for line in result.stdout.strip().split('\n'):
-                        line = line.strip()
-                        if line:
-                            nodes.append(line)
-                    self.log(f"  Head nodes: {', '.join(nodes)}")
-            elif overlay_nodes:
-                nodes = overlay_nodes
-                self.log(f"  Overlay nodes: {', '.join(nodes)}")
+            if nodes:
+                self.log(f"  Found slurmdbd nodes: {', '.join(nodes)}")
             else:
-                self.log(f"  {Colors.YELLOW}⚠{Colors.RESET} No nodes found in overlay '{overlay_name}'")
+                self.log(f"  {Colors.YELLOW}⚠{Colors.RESET} No devices found with slurmaccounting role")
             
         except Exception as e:
             self.log(f"  Warning: Could not discover slurmdbd nodes via cmsh: {e}", Colors.YELLOW)
         
         return nodes
+    
+    def _stop_slurmdbd_via_cmsh(self) -> bool:
+        """Stop slurmdbd on all nodes with slurmaccounting role via cmsh.
+        
+        Using cmsh ensures BCM won't automatically restart the service.
+        
+        Returns:
+            True if stop command succeeded, False otherwise
+        """
+        cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+        
+        try:
+            result = subprocess.run(
+                [cmsh_path, '-c', 'device; foreach -l slurmaccounting (services; stop slurmdbd)'],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            return result.returncode == 0
+        except Exception as e:
+            self.log(f"  Error running cmsh stop command: {e}", Colors.YELLOW)
+            return False
     
     def _prepare_for_restore(self) -> bool:
         """Prepare the database for restore by stopping slurmdbd and killing connections.
@@ -529,8 +492,10 @@ class SlurmDatabaseBackup:
         storage_pass = self.db_config['storage_pass']
         storage_loc = self.db_config['storage_loc']
         
-        # Discover nodes that run slurmdbd based on configuration overlay
-        self.log(f"  Discovering slurmdbd nodes from BCM configuration overlay...")
+        cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+        
+        # Discover nodes that run slurmdbd
+        self.log(f"  Discovering slurmdbd nodes via BCM...")
         slurmdbd_nodes = self._discover_slurmdbd_nodes()
         
         if not slurmdbd_nodes:
@@ -540,7 +505,7 @@ class SlurmDatabaseBackup:
         # Check which nodes have slurmdbd running
         nodes_with_slurmdbd = []
         if slurmdbd_nodes:
-            self.log(f"\n  Checking slurmdbd status on overlay nodes...")
+            self.log(f"\n  Checking slurmdbd status...")
             for node in slurmdbd_nodes:
                 try:
                     result = subprocess.run(
@@ -558,26 +523,16 @@ class SlurmDatabaseBackup:
                 except Exception as e:
                     self.log(f"    {node}: could not check ({e})")
         
-        # Stop slurmdbd if running
+        # Stop slurmdbd if running - use cmsh to prevent BCM auto-restart
         if nodes_with_slurmdbd:
             self.log(f"\n  {Colors.YELLOW}Found slurmdbd running on: {', '.join(nodes_with_slurmdbd)}{Colors.RESET}")
-            answer = input(f"  Stop slurmdbd on these nodes before restore? [Y/n]: ").strip().lower()
+            answer = input(f"  Stop slurmdbd via cmsh (prevents BCM auto-restart)? [Y/n]: ").strip().lower()
             if answer not in ('n', 'no'):
-                for node in nodes_with_slurmdbd:
-                    self.log(f"    Stopping slurmdbd on {node}...")
-                    try:
-                        result = subprocess.run(
-                            ['ssh', '-o', 'ConnectTimeout=5', node, 'systemctl stop slurmdbd'],
-                            capture_output=True,
-                            text=True,
-                            timeout=30
-                        )
-                        if result.returncode == 0:
-                            self.log(f"    {Colors.GREEN}✓{Colors.RESET} Stopped slurmdbd on {node}")
-                        else:
-                            self.log(f"    {Colors.YELLOW}⚠{Colors.RESET} Could not stop slurmdbd on {node}: {result.stderr.strip()}")
-                    except Exception as e:
-                        self.log(f"    {Colors.YELLOW}⚠{Colors.RESET} Error stopping slurmdbd on {node}: {e}")
+                self.log(f"    Stopping slurmdbd via cmsh...")
+                if self._stop_slurmdbd_via_cmsh():
+                    self.log(f"    {Colors.GREEN}✓{Colors.RESET} Stopped slurmdbd on all slurmaccounting nodes")
+                else:
+                    self.log(f"    {Colors.YELLOW}⚠{Colors.RESET} cmsh stop command may have failed")
                 # Give services time to fully stop
                 time.sleep(2)
             else:
