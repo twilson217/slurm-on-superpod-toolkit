@@ -4,8 +4,8 @@
 # Exclude baseline JSON files (these can be large and environment-specific)
 *baseline*.json
 
-# Exclude backup directories created by backup-slurm-unitfiles.py
-slurm-unitfiles-*/
+# Exclude backup directories created by backup-slurm-files.py
+slurm-files-*/
 
 # Python cache
 __pycache__/

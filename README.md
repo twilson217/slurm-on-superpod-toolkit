@@ -55,15 +55,25 @@ Migrate Slurm accounting database from dedicated controllers to BCM head nodes. 
 
 ---
 
-### `backup-slurm-unitfiles.py`
+### `backup-slurm-files.py`
 
-Backup systemd unit files for Slurm services from all relevant nodes. Useful before upgrades since unit files may be modified.
+Comprehensive backup of Slurm-related files from BCM clusters. Includes systemd unit files, custom prolog/epilog scripts, configuration files, and Lua plugins. Tracks symlinks in manifest for accurate restoration.
 
 ```bash
-./backup-slurm-unitfiles.py
+./backup-slurm-files.py                      # Backup all Slurm files
+./backup-slurm-files.py -o /path/to/backup   # Custom output directory
+./backup-slurm-files.py --restore <dir>      # Restore missing files from backup
+./backup-slurm-files.py -v                   # Verbose output
 ```
 
-Creates timestamped directory `slurm-unitfiles-<version>/` with unit files from all nodes with Slurm roles.
+**What it backs up:**
+- Systemd unit files (slurm*, munge*, mysql*, mariadb*) from all Slurm nodes
+- Custom prolog/epilog scripts from WLM settings (non-default paths)
+- Prolog/epilog symlinks in `/cm/local/apps/slurm/var/{prologs,epilogs}/` and their targets
+- Config files in Slurm etc directory (slurm.conf, gres.conf, cgroup.conf, topology.conf, etc.)
+- SPANK plugins (plugstack.conf.d/*) and Lua plugins (cli_filter.lua, job_submit.lua)
+
+**Restore behavior:** Only restores files that are missing; existing files are left untouched. Symlinks are recreated pointing to correct targets.
 
 ---
 
@@ -72,8 +82,8 @@ Creates timestamped directory `slurm-unitfiles-<version>/` with unit files from 
 ```
 ├── slurm-healthcheck.py        # Cluster health validation
 ├── backup-slurm-db.py          # DB backup/restore
+├── backup-slurm-files.py       # Slurm files backup/restore
 ├── migrate-slurmdb-to-bcm.py   # DB migration to BCM heads
-├── backup-slurm-unitfiles.py   # Systemd unit file backup
 ├── healthcheck-config.conf     # Healthcheck configuration
 ├── plans/                      # Upgrade and healthcheck plans
 │   ├── slurm-upgrade-23.11-to-25.05-plan.md
@@ -92,9 +102,10 @@ Creates timestamped directory `slurm-unitfiles-<version>/` with unit files from 
 
 1. **Pre-upgrade:** `./slurm-healthcheck.py --pre-upgrade`
 2. **Backup DB:** `./backup-slurm-db.py -o /root/slurm-upgrade-backups`
-3. **Backup unit files:** `./backup-slurm-unitfiles.py`
+3. **Backup files:** `./backup-slurm-files.py -o /root/slurm-upgrade-backups`
 4. **Perform upgrade** (follow `plans/slurm-upgrade-23.11-to-25.05-plan.md`)
-5. **Post-upgrade:** `./slurm-healthcheck.py --post-upgrade`
+5. **Restore missing files:** `./backup-slurm-files.py --restore /root/slurm-upgrade-backups/slurm-files-*`
+6. **Post-upgrade:** `./slurm-healthcheck.py --post-upgrade`
 
 ## License
 
