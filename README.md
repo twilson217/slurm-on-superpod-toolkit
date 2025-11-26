@@ -109,6 +109,27 @@ Comprehensive backup of Slurm-related files from BCM clusters. Includes systemd 
 5. **Restore missing files:** `./backup-slurm-files.py --restore /root/slurm-upgrade-backups/slurm-files-*`
 6. **Post-upgrade:** `./slurm-healthcheck.py --post-upgrade`
 
+## Troubleshooting
+
+### Cluster ID Mismatch
+
+If restoring a database from a different cluster (e.g., in a lab environment) and slurmctld fails to start with:
+
+```
+fatal: CLUSTER ID MISMATCH.
+slurmctld has been started with "ClusterID=1340" from the state files in StateSaveLocation, 
+but the DBD thinks it should be "2600".
+```
+
+**Fix:** Remove the clustername file to accept the cluster ID from the restored database:
+
+```bash
+rm /cm/shared/apps/slurm/var/cm/statesave/slurm/clustername
+systemctl restart slurmctld
+```
+
+This tells slurmctld to use the cluster ID from the database instead of the cached state files.
+
 ## License
 
 Internal NVIDIA tooling for DGX SuperPOD clusters.
