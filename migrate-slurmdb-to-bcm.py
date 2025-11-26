@@ -625,6 +625,94 @@ def format_bytes(size: int) -> str:
     return f"{size:.1f} TB"
 
 
+def discover_slurmdbd_nodes() -> list:
+    """Discover nodes that run slurmdbd based on BCM configuration overlay.
+    
+    Checks the configuration overlay with slurmaccounting role:
+    1. If 'all head nodes' is yes, get all head nodes
+    2. Otherwise, get specific nodes assigned to the overlay
+    
+    Returns:
+        List of node hostnames that should run slurmdbd
+    """
+    nodes = []
+    cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+    
+    if not os.path.exists(cmsh_path):
+        print("  cmsh not found, cannot discover slurmdbd nodes")
+        return nodes
+    
+    try:
+        # First find the overlay name that has the slurmaccounting role
+        result = subprocess.run(
+            [cmsh_path, '-c', 'configurationoverlay; foreach -r slurmaccounting (get name)'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode != 0 or not result.stdout.strip():
+            print(f"  Could not find overlay with slurmaccounting role")
+            return nodes
+        
+        overlay_name = result.stdout.strip().split('\n')[0].strip()
+        print(f"  Found slurmaccounting overlay: {overlay_name}")
+        
+        # Now get the overlay's node settings
+        result = subprocess.run(
+            [cmsh_path, '-c', f'configurationoverlay; use {overlay_name}; get allheadnodes; get nodes'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode != 0:
+            print(f"  Could not query overlay settings: {result.stderr}")
+            return nodes
+        
+        lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
+        
+        all_head_nodes = False
+        overlay_nodes = []
+        
+        for line in lines:
+            if line.lower() in ('yes', 'true'):
+                all_head_nodes = True
+            elif line.lower() in ('no', 'false'):
+                pass  # all_head_nodes stays False
+            elif ',' in line or line:
+                # This could be a node list
+                potential_nodes = [n.strip() for n in line.split(',') if n.strip()]
+                if potential_nodes and potential_nodes[0] not in ('yes', 'no', 'true', 'false'):
+                    overlay_nodes = potential_nodes
+        
+        if all_head_nodes:
+            # Get all head nodes
+            print(f"  Overlay '{overlay_name}' uses 'all head nodes = yes'")
+            result = subprocess.run(
+                [cmsh_path, '-c', 'device; foreach -c headnode (get hostname)'],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    line = line.strip()
+                    if line:
+                        nodes.append(line)
+                print(f"  Head nodes: {', '.join(nodes)}")
+        elif overlay_nodes:
+            nodes = overlay_nodes
+            print(f"  Overlay nodes: {', '.join(nodes)}")
+        else:
+            print(f"  ⚠ No nodes found in overlay '{overlay_name}'")
+        
+    except Exception as e:
+        print(f"  Warning: Could not discover slurmdbd nodes via cmsh: {e}")
+    
+    return nodes
+
+
 def prepare_for_migration(cfg) -> bool:
     """Prepare the source database for migration by stopping slurmdbd and killing connections.
     
@@ -642,52 +730,34 @@ def prepare_for_migration(cfg) -> bool:
     storage_pass = cfg['storage_pass']
     storage_loc = cfg['storage_loc']
     
-    # Find nodes running slurmdbd using cmsh
-    slurmdbd_nodes = []
-    cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+    # Discover nodes that run slurmdbd based on configuration overlay
+    print("\nDiscovering slurmdbd nodes from BCM configuration overlay...")
+    slurmdbd_nodes = discover_slurmdbd_nodes()
     
-    print("\nDiscovering nodes with slurmdbd (via slurmaccounting role)...")
-    try:
-        if os.path.exists(cmsh_path):
-            result = subprocess.run(
-                [cmsh_path, '-c', 'device; foreach -r slurmaccounting (get hostname)'],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            if result.returncode == 0:
-                for line in result.stdout.strip().split('\n'):
-                    line = line.strip()
-                    if line:
-                        slurmdbd_nodes.append(line)
-    except Exception as e:
-        print(f"  Warning: Could not discover slurmdbd nodes via cmsh: {e}")
-    
-    if slurmdbd_nodes:
-        print(f"  Found nodes with slurmaccounting role: {', '.join(slurmdbd_nodes)}")
-    else:
-        print("  No nodes found via cmsh, will check storage host directly.")
-        slurmdbd_nodes = [storage_host]
+    if not slurmdbd_nodes:
+        print("  ⚠ Could not discover slurmdbd nodes from BCM")
+        print("    You may need to manually stop slurmdbd before proceeding")
     
     # Check which nodes have slurmdbd running
     nodes_with_slurmdbd = []
-    print("\nChecking which nodes have slurmdbd running...")
-    for node in slurmdbd_nodes:
-        try:
-            result = subprocess.run(
-                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
-                 node, 'systemctl is-active slurmdbd'],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            if result.returncode == 0 and 'active' in result.stdout:
-                nodes_with_slurmdbd.append(node)
-                print(f"    {node}: slurmdbd is running")
-            else:
-                print(f"    {node}: slurmdbd not running")
-        except Exception as e:
-            print(f"    {node}: could not check ({e})")
+    if slurmdbd_nodes:
+        print("\nChecking slurmdbd status on overlay nodes...")
+        for node in slurmdbd_nodes:
+            try:
+                result = subprocess.run(
+                    ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                     node, 'systemctl is-active slurmdbd'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0 and 'active' in result.stdout:
+                    nodes_with_slurmdbd.append(node)
+                    print(f"    {node}: slurmdbd is running")
+                else:
+                    print(f"    {node}: slurmdbd is stopped")
+            except Exception as e:
+                print(f"    {node}: could not check ({e})")
     
     # Stop slurmdbd if running
     if nodes_with_slurmdbd:
