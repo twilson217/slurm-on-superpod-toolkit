@@ -563,7 +563,7 @@ quit
     print(f"    Current Nodes: {current_nodes if current_nodes else '(none)'}")
     print(f"    Current All head nodes: {current_allheadnodes}")
     print(f"  Role: slurmaccounting")
-    print(f"    Current primary: {current_primary}")
+    print(f"    Current primaryaccountingserver: {current_primary}")
     print(f"    Current storagehost: {current_storagehost}")
     
     # Show planned changes
@@ -572,7 +572,7 @@ quit
     print(f"    nodes         : (will be cleared)")
     print(f"    allheadnodes  : yes")
     print(f"  Role: slurmaccounting")
-    print(f"    primary       : {primary_headnode}")
+    print(f"    primaryaccountingserver: {primary_headnode}")
     print(f"    storagehost   : master  (BCM HA virtual hostname)")
     
     if not skip_confirm:
@@ -584,24 +584,31 @@ quit
     # Build cmsh commands to update configuration
     # Note: storagehost is set to "master" which is the BCM HA virtual hostname
     # that always points to the active head node
-    cmsh_update = f"""configurationoverlay
-use {overlay_name}
-roles
-use slurmaccounting
-set primary {primary_headnode}
-set storagehost master
-commit
-exit
-set nodes
-set allheadnodes yes
-commit
-quit
-"""
+    # Use cmsh -c with semicolons for cleaner execution
+    # Parameter names from BCM admin manual:
+    #   primaryaccountingserver - sets DbdHost (which node is primary)
+    #   storagehost - sets StorageHost (MySQL server)
+    cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+    
+    # Update slurmaccounting role settings
+    role_cmd = (f"configurationoverlay; use {overlay_name}; roles; use slurmaccounting; "
+                f"set primaryaccountingserver {primary_headnode}; set storagehost master; commit")
+    
+    # Update overlay settings (run on all head nodes, clear specific node assignments)
+    overlay_cmd = f"configurationoverlay; use {overlay_name}; set nodes; set allheadnodes yes; commit"
     
     print("\nApplying BCM configuration changes...")
     try:
-        result = run_cmsh(cmsh_update)
-        print(f"  ✓ Updated slurmaccounting role: primary={primary_headnode}, storagehost=master")
+        # Update role
+        result = subprocess.run([cmsh_path, '-c', role_cmd], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Role update failed: {result.stderr}")
+        print(f"  ✓ Updated slurmaccounting role: primaryaccountingserver={primary_headnode}, storagehost=master")
+        
+        # Update overlay
+        result = subprocess.run([cmsh_path, '-c', overlay_cmd], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Overlay update failed: {result.stderr}")
         print(f"  ✓ Updated overlay: allheadnodes=yes, nodes cleared")
         return True
     except Exception as e:
@@ -1195,15 +1202,15 @@ def main():
     
     if bcm_updated:
         print(f"\n✓ BCM configuration updated:")
-        print(f"    slurmaccounting primary: {primary_headnode}")
+        print(f"    slurmaccounting primaryaccountingserver: {primary_headnode}")
         print(f"    slurmaccounting storagehost: master")
         print(f"    overlay allheadnodes: yes")
     else:
         print(f"\n⚠ BCM configuration was NOT updated automatically.")
         print("  You must manually update via cmsh:")
         print(f"    cmsh -c 'configurationoverlay; use <overlay>; roles; use slurmaccounting; "
-              f"set primary {primary_headnode}; set storagehost master; commit; "
-              f"exit; set nodes; set allheadnodes yes; commit'")
+              f"set primaryaccountingserver {primary_headnode}; set storagehost master; commit'")
+        print(f"    cmsh -c 'configurationoverlay; use <overlay>; set nodes; set allheadnodes yes; commit'")
     
     print(f"\nNext steps (in order):")
     print("  1) Verify MySQL HA is healthy:")
