@@ -26,6 +26,8 @@ import os
 import sys
 import subprocess
 import re
+import time
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -607,6 +609,181 @@ quit
         return False
 
 
+def format_time(seconds: float) -> str:
+    """Format seconds into MM:SS format."""
+    minutes = int(seconds) // 60
+    secs = int(seconds) % 60
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def format_bytes(size: int) -> str:
+    """Format bytes to human readable format."""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def prepare_for_migration(cfg) -> bool:
+    """Prepare the source database for migration by stopping slurmdbd and killing connections.
+    
+    This ensures a consistent snapshot without blocking issues.
+    
+    Returns:
+        True if ready to proceed, False if preparation failed
+    """
+    print(f"\n{'=' * 65}")
+    print("PREPARING FOR MIGRATION")
+    print('=' * 65)
+    
+    storage_host = cfg['storage_host']
+    storage_user = cfg['storage_user']
+    storage_pass = cfg['storage_pass']
+    storage_loc = cfg['storage_loc']
+    
+    # Find nodes running slurmdbd using cmsh
+    slurmdbd_nodes = []
+    cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+    
+    print("\nDiscovering nodes with slurmdbd (via slurmaccounting role)...")
+    try:
+        if os.path.exists(cmsh_path):
+            result = subprocess.run(
+                [cmsh_path, '-c', 'device; foreach -r slurmaccounting (get hostname)'],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    line = line.strip()
+                    if line:
+                        slurmdbd_nodes.append(line)
+    except Exception as e:
+        print(f"  Warning: Could not discover slurmdbd nodes via cmsh: {e}")
+    
+    if slurmdbd_nodes:
+        print(f"  Found nodes with slurmaccounting role: {', '.join(slurmdbd_nodes)}")
+    else:
+        print("  No nodes found via cmsh, will check storage host directly.")
+        slurmdbd_nodes = [storage_host]
+    
+    # Check which nodes have slurmdbd running
+    nodes_with_slurmdbd = []
+    print("\nChecking which nodes have slurmdbd running...")
+    for node in slurmdbd_nodes:
+        try:
+            result = subprocess.run(
+                ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                 node, 'systemctl is-active slurmdbd'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0 and 'active' in result.stdout:
+                nodes_with_slurmdbd.append(node)
+                print(f"    {node}: slurmdbd is running")
+            else:
+                print(f"    {node}: slurmdbd not running")
+        except Exception as e:
+            print(f"    {node}: could not check ({e})")
+    
+    # Stop slurmdbd if running
+    if nodes_with_slurmdbd:
+        print(f"\n  Found slurmdbd running on: {', '.join(nodes_with_slurmdbd)}")
+        answer = input(f"  Stop slurmdbd on these nodes before migration? [Y/n]: ").strip().lower()
+        if answer not in ('n', 'no'):
+            for node in nodes_with_slurmdbd:
+                print(f"    Stopping slurmdbd on {node}...")
+                try:
+                    result = subprocess.run(
+                        ['ssh', '-o', 'ConnectTimeout=5', node, 'systemctl stop slurmdbd'],
+                        capture_output=True,
+                        text=True,
+                        timeout=30
+                    )
+                    if result.returncode == 0:
+                        print(f"    ✓ Stopped slurmdbd on {node}")
+                    else:
+                        print(f"    ⚠ Could not stop slurmdbd on {node}: {result.stderr.strip()}")
+                except Exception as e:
+                    print(f"    ⚠ Error stopping slurmdbd on {node}: {e}")
+            # Give services time to fully stop
+            time.sleep(2)
+    else:
+        print(f"\n  ✓ No slurmdbd services found running")
+    
+    # Check for blocking database connections on the source host
+    print(f"\nChecking for blocking database connections on {storage_host}...")
+    blocking_connections = []
+    
+    try:
+        # Query processlist for connections to our database
+        check_cmd = [
+            'mysql',
+            '-h', storage_host,
+            '-u', storage_user,
+            f"-p{storage_pass}",
+            '-N', '-e',
+            f"SELECT Id, User, Host, db, Command, Time FROM information_schema.processlist "
+            f"WHERE db = '{storage_loc}' AND Command != 'Query' AND Id != CONNECTION_ID();"
+        ]
+        result = subprocess.run(check_cmd, capture_output=True, text=True, timeout=10)
+        
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.strip().split('\n'):
+                parts = line.split('\t')
+                if len(parts) >= 4:
+                    conn_id = parts[0]
+                    conn_user = parts[1]
+                    conn_host = parts[2]
+                    conn_time = parts[5] if len(parts) > 5 else '0'
+                    blocking_connections.append({
+                        'id': conn_id,
+                        'user': conn_user,
+                        'host': conn_host,
+                        'time': conn_time
+                    })
+    except Exception as e:
+        print(f"  Warning: Could not check for blocking connections: {e}")
+    
+    # Kill blocking connections
+    if blocking_connections:
+        print(f"  Found {len(blocking_connections)} connection(s) that may block migration:")
+        for conn in blocking_connections:
+            print(f"    - ID {conn['id']}: {conn['user']}@{conn['host']} (idle {conn['time']}s)")
+        
+        answer = input(f"  Kill these connections to proceed? [Y/n]: ").strip().lower()
+        if answer not in ('n', 'no'):
+            for conn in blocking_connections:
+                try:
+                    kill_cmd = [
+                        'mysql',
+                        '-h', storage_host,
+                        '-u', storage_user,
+                        f"-p{storage_pass}",
+                        '-e', f"KILL {conn['id']};"
+                    ]
+                    result = subprocess.run(kill_cmd, capture_output=True, text=True, timeout=10)
+                    if result.returncode == 0:
+                        print(f"    ✓ Killed connection {conn['id']}")
+                    else:
+                        # Connection may have already closed
+                        print(f"    ⚠ Connection {conn['id']} already closed or could not kill")
+                except Exception as e:
+                    print(f"    ⚠ Error killing connection {conn['id']}: {e}")
+            # Give a moment for connections to fully close
+            time.sleep(1)
+        else:
+            print(f"\n  Warning: Migration may encounter lock issues.")
+    else:
+        print(f"  ✓ No blocking connections found")
+    
+    print(f"\n  ✓ Ready for migration")
+    return True
+
+
 def dump_remote_slurm_db(cfg, dump_path: Path):
     """Dump the remote Slurm accounting DB using mysqldump from this head node.
     
@@ -623,7 +800,7 @@ def dump_remote_slurm_db(cfg, dump_path: Path):
     storage_pass = cfg["storage_pass"]
     storage_loc = cfg["storage_loc"]
 
-    print(f"Dumping Slurm accounting DB from {storage_host} ...")
+    print(f"\nDumping Slurm accounting DB from {storage_host} ...")
     dump_dir = dump_path.parent
     dump_dir.mkdir(parents=True, exist_ok=True)
 
@@ -641,15 +818,78 @@ def dump_remote_slurm_db(cfg, dump_path: Path):
         storage_loc,  # Database name without --databases flag
     ]
 
-    with open(dump_path, "w") as out_f:
-        result = subprocess.run(cmd, stdout=out_f, stderr=subprocess.PIPE, text=True)
-
-    if result.returncode != 0:
+    # Run mysqldump with progress indicator
+    dump_complete = [False]
+    dump_error = [None]
+    start_time = time.time()
+    
+    def progress_reporter():
+        spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+        spin_idx = 0
+        
+        while not dump_complete[0]:
+            elapsed = time.time() - start_time
+            
+            # Check current file size
+            try:
+                if dump_path.exists():
+                    current_size = dump_path.stat().st_size
+                    size_str = format_bytes(current_size)
+                else:
+                    size_str = "0 B"
+            except:
+                size_str = "..."
+            
+            status = f"\r  {spinner_chars[spin_idx]} Exporting... {format_time(elapsed)} elapsed | {size_str} written"
+            sys.stdout.write(status)
+            sys.stdout.flush()
+            
+            spin_idx = (spin_idx + 1) % len(spinner_chars)
+            time.sleep(0.5)
+        
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    
+    # Start progress thread
+    progress_thread = threading.Thread(target=progress_reporter, daemon=True)
+    progress_thread.start()
+    
+    try:
+        with open(dump_path, "w") as out_f:
+            result = subprocess.run(cmd, stdout=out_f, stderr=subprocess.PIPE, text=True)
+        
+        if result.returncode != 0:
+            dump_error[0] = result.stderr
+    except Exception as e:
+        dump_error[0] = str(e)
+    finally:
+        dump_complete[0] = True
+        progress_thread.join(timeout=2)
+    
+    if dump_error[0]:
         raise RuntimeError(
-            f"mysqldump failed (host={storage_host}, db={storage_loc}):\n{result.stderr}"
+            f"mysqldump failed (host={storage_host}, db={storage_loc}):\n{dump_error[0]}"
         )
 
-    print(f"  Dump created at: {dump_path}")
+    final_size = dump_path.stat().st_size
+    elapsed = time.time() - start_time
+    print(f"  ✓ Dump completed: {format_bytes(final_size)} in {format_time(elapsed)}")
+    print(f"    Saved to: {dump_path}")
+
+
+def get_local_table_count(storage_loc: str, mysql_base: list) -> int:
+    """Query the local database for the current number of tables."""
+    try:
+        query = f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '{storage_loc}';"
+        result = subprocess.run(
+            mysql_base + ['-N', '-e', query],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip().isdigit():
+            return int(result.stdout.strip())
+    except:
+        pass
+    return -1
 
 
 def import_db_to_local(cfg, dump_path: Path):
@@ -668,28 +908,78 @@ def import_db_to_local(cfg, dump_path: Path):
     if socket_path:
         mysql_base.extend(["--socket", socket_path])
 
-    print("Creating database on local MariaDB/MySQL ...")
+    print("\nCreating database on local MariaDB/MySQL ...")
     create_db_sql = (
         f"CREATE DATABASE IF NOT EXISTS `{storage_loc}` "
         f"DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
     )
     run_cmd(mysql_base + ["-e", create_db_sql])
 
-    print("Importing dump into local database ... (this may take a while)")
-    # Use --default-character-set for import as well
-    import_cmd = mysql_base + ["--default-character-set=utf8mb4", storage_loc]
-    with open(dump_path, "r") as in_f:
-        result = subprocess.run(
-            import_cmd,
-            stdin=in_f,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    if result.returncode != 0:
+    # Get dump file size for display
+    dump_size = dump_path.stat().st_size
+    print(f"\nImporting dump into local database...")
+    print(f"  Source file: {format_bytes(dump_size)}")
+    
+    # Run import with progress indicator
+    import_complete = [False]
+    import_error = [None]
+    start_time = time.time()
+    
+    def progress_reporter():
+        spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+        spin_idx = 0
+        
+        while not import_complete[0]:
+            elapsed = time.time() - start_time
+            
+            # Query table count for progress
+            current_table_count = get_local_table_count(storage_loc, mysql_base)
+            if current_table_count >= 0:
+                table_str = f"| {current_table_count} tables"
+            else:
+                table_str = ""
+            
+            status = f"\r  {spinner_chars[spin_idx]} Importing... {format_time(elapsed)} elapsed {table_str}   "
+            sys.stdout.write(status)
+            sys.stdout.flush()
+            
+            spin_idx = (spin_idx + 1) % len(spinner_chars)
+            time.sleep(1)
+        
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    
+    # Start progress thread
+    progress_thread = threading.Thread(target=progress_reporter, daemon=True)
+    progress_thread.start()
+    
+    try:
+        # Use --default-character-set for import as well
+        import_cmd = mysql_base + ["--default-character-set=utf8mb4", storage_loc]
+        with open(dump_path, "r") as in_f:
+            result = subprocess.run(
+                import_cmd,
+                stdin=in_f,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        if result.returncode != 0:
+            import_error[0] = result.stderr
+    except Exception as e:
+        import_error[0] = str(e)
+    finally:
+        import_complete[0] = True
+        progress_thread.join(timeout=2)
+    
+    if import_error[0]:
         raise RuntimeError(
-            f"mysql import failed into local DB {storage_loc}:\n{result.stderr}"
+            f"mysql import failed into local DB {storage_loc}:\n{import_error[0]}"
         )
+    
+    elapsed = time.time() - start_time
+    final_table_count = get_local_table_count(storage_loc, mysql_base)
+    print(f"  ✓ Import completed: {final_table_count} tables in {format_time(elapsed)}")
 
     print("Granting privileges to Slurm DB user on local MariaDB/MySQL ...")
     # Use mysql_native_password for compatibility between MySQL 8.x and MariaDB
@@ -811,21 +1101,6 @@ def main():
         print("Aborting at user request.")
         sys.exit(0)
 
-    # Suggest that Slurm services be stopped or quiesced first
-    print(
-        "\n" + "=" * 65 + "\n"
-        "IMPORTANT: For a consistent snapshot, you should stop slurmdbd on the\n"
-        f"current StorageHost ({cfg['storage_host']}) before proceeding.\n"
-        "\nYou can do this with:\n"
-        f"  ssh {cfg['storage_host']} systemctl stop slurmdbd\n"
-        "=" * 65
-    )
-    
-    answer = input("\nHave you stopped slurmdbd or is it safe to proceed? [y/N]: ").strip().lower()
-    if answer not in ("y", "yes"):
-        print("Aborting. Please stop slurmdbd and run this script again.")
-        sys.exit(0)
-
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     dump_dir = Path("/root/slurm-db-migration")
     dump_path = dump_dir / f"slurm_acct_db-{ts}.sql"
@@ -839,9 +1114,14 @@ def main():
         print("\nERROR: Cannot establish database connectivity. Aborting.", file=sys.stderr)
         sys.exit(1)
 
+    # Step 0.5: Prepare for migration (stop slurmdbd, kill connections)
+    if not prepare_for_migration(cfg):
+        print("\nERROR: Could not prepare for migration. Aborting.", file=sys.stderr)
+        sys.exit(1)
+
     # Step 1-3: Database migration
     print(f"\n{'=' * 65}")
-    print("STEP 1-3: DATABASE MIGRATION")
+    print("DATABASE MIGRATION")
     print('=' * 65)
     
     try:
