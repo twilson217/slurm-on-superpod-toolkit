@@ -1204,6 +1204,24 @@ def import_db_to_local(cfg, dump_path: Path):
                 f"FLUSH PRIVILEGES;"
             )
             run_cmd(mysql_base + ["-e", grant_sql_simple])
+    
+    # Ensure the password is set correctly even if user already existed
+    # This is critical when migrating to BCM head nodes where the slurm user
+    # may already exist with a different password
+    print("  Ensuring Slurm DB user password matches slurmdbd.conf...")
+    alter_sql = f"ALTER USER '{storage_user}'@'%' IDENTIFIED BY '{storage_pass}'; FLUSH PRIVILEGES;"
+    result = subprocess.run(
+        mysql_base + ["-e", alter_sql],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode == 0:
+        print(f"  ✓ Slurm DB user password updated to match slurmdbd.conf")
+    else:
+        print(f"  ⚠ Warning: Could not update password: {result.stderr}")
+        print(f"    You may need to manually run:")
+        print(f"    mysql -e \"ALTER USER '{storage_user}'@'%' IDENTIFIED BY '<password>'; FLUSH PRIVILEGES;\"")
 
 
 def start_slurmdbd_services():
