@@ -1068,22 +1068,27 @@ def import_db_to_local(cfg, dump_path: Path):
             run_cmd(mysql_base + ["-e", grant_sql_simple])
 
 
-def restart_slurmdbd_services():
-    """Restart slurmdbd services on head nodes after configuration change."""
-    print("\nRestarting slurmdbd services on head nodes...")
+def start_slurmdbd_services():
+    """Start slurmdbd services on nodes with slurmaccounting role via cmsh."""
+    print("\nStarting slurmdbd services...")
     
-    # Use cmsh to restart slurmdbd on all nodes with the slurmaccounting role
-    cmsh_restart = """device
-foreach -r slurmaccounting (services; restart slurmdbd)
-quit
-"""
+    cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
     try:
-        result = run_cmsh(cmsh_restart, check=False)
-        print("  ✓ Sent restart command to slurmdbd on all accounting nodes")
-        return True
+        result = subprocess.run(
+            [cmsh_path, '-c', 'device; foreach -l slurmaccounting (services; start slurmdbd)'],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        if result.returncode == 0:
+            print("  ✓ Started slurmdbd on all slurmaccounting nodes")
+            return True
+        else:
+            print(f"  ⚠ Could not start slurmdbd: {result.stderr}")
+            return False
     except Exception as e:
-        print(f"  ⚠ Could not restart slurmdbd automatically: {e}")
-        print("    Please manually restart slurmdbd: systemctl restart slurmdbd")
+        print(f"  ⚠ Could not start slurmdbd automatically: {e}")
+        print("    Manual start: cmsh -c \"device; foreach -l slurmaccounting (services; start slurmdbd)\"")
         return False
 
 
@@ -1177,9 +1182,8 @@ def main():
     # Step 4: Update BCM configuration
     bcm_updated = update_bcm_configuration(primary_headnode, skip_confirm=False)
     
-    # Step 5: Restart slurmdbd
-    if bcm_updated:
-        restart_slurmdbd_services()
+    # Note: We do NOT auto-restart slurmdbd here because cmha dbreclone 
+    # needs to run first to sync the database to the passive head node
 
     # Final summary
     print(f"\n{'=' * 65}")
@@ -1201,16 +1205,18 @@ def main():
               f"set primary {primary_headnode}; set storagehost master; commit; "
               f"exit; set nodes; set allheadnodes yes; commit'")
     
-    print("\nNext steps:")
+    print(f"\nNext steps (in order):")
     print("  1) Verify MySQL HA is healthy:")
     print("     cmha status")
-    print("  2) Verify slurmdbd is running on head nodes:")
+    print("  2) Sync database to the passive head node:")
+    print("     cmha dbreclone <passive-head-node>")
+    print("  3) Start slurmdbd services via cmsh:")
+    print("     cmsh -c \"device; foreach -l slurmaccounting (services; start slurmdbd)\"")
+    print("  4) Verify slurmdbd is running:")
     print("     systemctl status slurmdbd")
-    print("  3) Test Slurm accounting:")
+    print("  5) Test Slurm accounting:")
     print("     sacctmgr show cluster")
     print("     sacctmgr show account")
-    print("  4) If using HA, sync the database to the passive head node:")
-    print("     cmha dbreclone <passive-head-node>")
     
     print(f"\n{'=' * 65}")
 
