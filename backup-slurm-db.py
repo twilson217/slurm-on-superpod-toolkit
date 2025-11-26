@@ -479,6 +479,26 @@ class SlurmDatabaseBackup:
             self.log(f"  Error running cmsh stop command: {e}", Colors.YELLOW)
             return False
     
+    def _start_slurmdbd_via_cmsh(self) -> bool:
+        """Start slurmdbd on all nodes with slurmaccounting role via cmsh.
+        
+        Returns:
+            True if start command succeeded, False otherwise
+        """
+        cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+        
+        try:
+            result = subprocess.run(
+                [cmsh_path, '-c', 'device; foreach -l slurmaccounting (services; start slurmdbd)'],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            return result.returncode == 0
+        except Exception as e:
+            self.log(f"  Error running cmsh start command: {e}", Colors.YELLOW)
+            return False
+    
     def _prepare_for_restore(self) -> bool:
         """Prepare the database for restore by stopping slurmdbd and killing connections.
         
@@ -860,11 +880,19 @@ class SlurmDatabaseBackup:
             self.log(f"  Database: {self.db_config['storage_loc']}")
             self.log(f"  Host: {self.db_config['storage_host']}")
             
-            # Post-restore advice
-            self.log(f"\n{Colors.BOLD}Post-restore steps:{Colors.RESET}")
-            self.log("  1. Restart slurmdbd service: systemctl restart slurmdbd")
-            self.log("  2. Verify with: sacctmgr show cluster")
-            self.log("  3. Check accounting: sacctmgr show account")
+            # Start slurmdbd services via cmsh
+            self.log(f"\n{Colors.BOLD}Starting slurmdbd services...{Colors.RESET}")
+            if self._start_slurmdbd_via_cmsh():
+                self.log(f"  {Colors.GREEN}✓{Colors.RESET} Started slurmdbd on all slurmaccounting nodes")
+            else:
+                self.log(f"  {Colors.YELLOW}⚠{Colors.RESET} Could not start slurmdbd via cmsh")
+                self.log(f"    Manual start: cmsh -c \"device; foreach -l slurmaccounting (services; start slurmdbd)\"")
+            
+            # Post-restore verification steps
+            self.log(f"\n{Colors.BOLD}Verification steps:{Colors.RESET}")
+            self.log("  1. Verify slurmdbd is running: systemctl status slurmdbd")
+            self.log("  2. Check cluster: sacctmgr show cluster")
+            self.log("  3. Check accounts: sacctmgr show account")
             
             return True
         
