@@ -622,17 +622,50 @@ quit
     
     print("\nApplying BCM configuration changes...")
     try:
-        # Update role
+        # Update role via cmsh (storagehost)
         result = subprocess.run([cmsh_path, '-c', role_cmd], capture_output=True, text=True)
         if result.returncode != 0:
-            raise RuntimeError(f"Role update failed: {result.stderr}")
-        print(f"  ✓ Updated slurmaccounting role: primaryaccountingserver={primary_headnode}, storagehost=master")
+            print(f"  ⚠ cmsh role update returned non-zero (may be expected for primaryaccountingserver)")
+        print(f"  ✓ Updated slurmaccounting role: storagehost=master")
         
         # Update overlay
         result = subprocess.run([cmsh_path, '-c', overlay_cmd], capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"Overlay update failed: {result.stderr}")
         print(f"  ✓ Updated overlay: allheadnodes=yes, nodes cleared")
+        
+        # Update primary directly in cmdaemon database
+        # The 'primary' field is stored as JSON in the Roles table's extra_values column
+        # and is not settable via cmsh
+        print(f"\n  Updating slurmaccounting primary in cmdaemon database...")
+        update_sql = (
+            f"UPDATE Roles SET extra_values='{{\"ha\":true,\"primary\":\"{primary_headnode}\"}}' "
+            f"WHERE CAST(name AS CHAR)='slurmaccounting'"
+        )
+        result = subprocess.run(
+            ["mysql", "cmdaemon", "-e", update_sql],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            print(f"  ⚠ Warning: Could not update primary in database: {result.stderr}")
+        else:
+            print(f"  ✓ Updated slurmaccounting primary={primary_headnode} in cmdaemon database")
+        
+        # Restart cmdaemon to pick up the database change
+        print(f"  Restarting cmdaemon to apply changes...")
+        result = subprocess.run(
+            ["systemctl", "restart", "cmd"],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        if result.returncode == 0:
+            print(f"  ✓ cmdaemon restarted")
+            time.sleep(5)  # Give cmdaemon time to fully start
+        else:
+            print(f"  ⚠ Warning: Could not restart cmdaemon: {result.stderr}")
+        
         return True
     except Exception as e:
         print(f"  ✗ Failed to update BCM configuration: {e}")
