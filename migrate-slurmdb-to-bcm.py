@@ -130,6 +130,271 @@ def detect_mysql_socket() -> str:
     return ""
 
 
+def run_ssh(host: str, cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
+    """Run a command on a remote host via SSH."""
+    ssh_cmd = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ConnectTimeout=5",
+        host,
+        cmd,
+    ]
+    return subprocess.run(
+        ssh_cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def test_db_connectivity(cfg) -> tuple:
+    """Test if we can connect to the remote database from this host.
+    
+    Returns:
+        (success: bool, error_type: str, error_message: str)
+        error_type can be: 'none', 'host_denied', 'auth_failed', 'connection_failed', 'other'
+    """
+    storage_host = cfg["storage_host"]
+    storage_user = cfg["storage_user"]
+    storage_pass = cfg["storage_pass"]
+    storage_loc = cfg["storage_loc"]
+    
+    # Try a simple connection test
+    cmd = [
+        "mysql",
+        "-h", storage_host,
+        "-u", storage_user,
+        f"-p{storage_pass}",
+        "-e", "SELECT 1;",
+        storage_loc,
+    ]
+    
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+    )
+    
+    if result.returncode == 0:
+        return (True, 'none', '')
+    
+    stderr = result.stderr.lower()
+    
+    # Check for explicit host not allowed error
+    # e.g., "Host 'hostname' is not allowed to connect to this MySQL server"
+    if "host" in stderr and "not allowed" in stderr:
+        return (False, 'host_denied', result.stderr.strip())
+    
+    # Check for access denied with host in the message
+    # e.g., "Access denied for user 'slurm'@'hostname' (using password: YES)"
+    # This happens when the user exists for some hosts (e.g., localhost) but not for this host
+    if "access denied" in stderr and "@'" in stderr:
+        # Extract the host from the error message to see if it's different from localhost
+        import re
+        match = re.search(r"@'([^']+)'", result.stderr)
+        if match:
+            denied_host = match.group(1).lower()
+            # If the denied host is not localhost, it's a host permission issue
+            if denied_host not in ('localhost', '127.0.0.1', '::1'):
+                return (False, 'host_denied', result.stderr.strip())
+    
+    # Check for authentication failure (user doesn't exist or wrong password for localhost)
+    if "access denied" in stderr and "using password" in stderr:
+        return (False, 'auth_failed', result.stderr.strip())
+    
+    # Check for connection failure
+    if "can't connect" in stderr or "connection refused" in stderr:
+        return (False, 'connection_failed', result.stderr.strip())
+    
+    return (False, 'other', result.stderr.strip())
+
+
+def check_remote_mysql_client(host: str) -> tuple:
+    """Check if mysql client is available on a remote host.
+    
+    Returns:
+        (available: bool, mysql_path: str)
+    """
+    # Check common locations
+    result = run_ssh(host, "which mysql 2>/dev/null || command -v mysql 2>/dev/null")
+    if result.returncode == 0 and result.stdout.strip():
+        return (True, result.stdout.strip())
+    
+    # Check if it exists but not in PATH
+    for path in ["/usr/bin/mysql", "/usr/local/bin/mysql"]:
+        result = run_ssh(host, f"test -x {path} && echo {path}")
+        if result.returncode == 0 and result.stdout.strip():
+            return (True, result.stdout.strip())
+    
+    return (False, "")
+
+
+def get_local_hostname_for_db() -> str:
+    """Get the hostname/IP that the database server would see for connections from this host."""
+    result = run_cmd(["hostname", "-f"], capture_output=True, check=False)
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    
+    result = run_cmd(["hostname"], capture_output=True, check=False)
+    return result.stdout.strip() if result.returncode == 0 else "localhost"
+
+
+def fix_remote_db_permissions(cfg, mysql_path: str = "/usr/bin/mysql") -> bool:
+    """SSH to the remote database host and grant access from any host.
+    
+    This updates the MySQL user to allow connections from '%' (any host).
+    
+    Args:
+        cfg: Database configuration dictionary
+        mysql_path: Path to mysql client on remote host
+        
+    Returns:
+        True if permissions were updated successfully
+    """
+    storage_host = cfg["storage_host"]
+    storage_user = cfg["storage_user"]
+    storage_pass = cfg["storage_pass"]
+    storage_loc = cfg["storage_loc"]
+    
+    print(f"\n  Attempting to fix database permissions on {storage_host}...")
+    
+    # Common socket paths to try
+    socket_paths = [
+        "/var/lib/mysql/mysql.sock",
+        "/var/run/mysqld/mysqld.sock",
+        "/tmp/mysql.sock",
+    ]
+    
+    # Find a working socket on the remote host
+    working_socket = None
+    for socket_path in socket_paths:
+        result = run_ssh(storage_host, f"test -S {socket_path} && echo exists")
+        if result.returncode == 0 and "exists" in result.stdout:
+            working_socket = socket_path
+            break
+    
+    if not working_socket:
+        print(f"    ✗ Could not find MySQL socket on {storage_host}")
+        return False
+    
+    # Build the SQL to grant access from any host
+    # We use socket auth as root to update the user permissions
+    grant_sql = (
+        f"GRANT ALL PRIVILEGES ON `{storage_loc}`.* TO '{storage_user}'@'%' "
+        f"IDENTIFIED BY '{storage_pass}'; FLUSH PRIVILEGES;"
+    )
+    
+    # Escape single quotes for shell
+    grant_sql_escaped = grant_sql.replace("'", "'\"'\"'")
+    
+    # Run as root via socket authentication
+    remote_cmd = f"{mysql_path} --socket={working_socket} -e '{grant_sql_escaped}'"
+    
+    print(f"    Running: ssh {storage_host} \"{mysql_path} --socket=... -e 'GRANT ...'\"")
+    
+    result = run_ssh(storage_host, remote_cmd, timeout=60)
+    
+    if result.returncode == 0:
+        print(f"    ✓ Granted '{storage_user}'@'%' access to {storage_loc}")
+        return True
+    else:
+        # Try alternative: maybe user already exists with localhost, need to create for %
+        print(f"    First attempt failed, trying alternative syntax...")
+        
+        # Try CREATE USER IF NOT EXISTS with GRANT
+        alt_sql = (
+            f"CREATE USER IF NOT EXISTS '{storage_user}'@'%' IDENTIFIED BY '{storage_pass}'; "
+            f"GRANT ALL PRIVILEGES ON `{storage_loc}`.* TO '{storage_user}'@'%'; "
+            f"FLUSH PRIVILEGES;"
+        )
+        alt_sql_escaped = alt_sql.replace("'", "'\"'\"'")
+        remote_cmd = f"{mysql_path} --socket={working_socket} -e '{alt_sql_escaped}'"
+        
+        result = run_ssh(storage_host, remote_cmd, timeout=60)
+        
+        if result.returncode == 0:
+            print(f"    ✓ Created '{storage_user}'@'%' with access to {storage_loc}")
+            return True
+        else:
+            print(f"    ✗ Failed to update permissions: {result.stderr.strip()}")
+            return False
+
+
+def ensure_db_connectivity(cfg) -> bool:
+    """Ensure we can connect to the remote database, fixing permissions if needed.
+    
+    Returns:
+        True if connectivity is established (or was fixed)
+        False if we cannot connect and cannot fix it
+    """
+    storage_host = cfg["storage_host"]
+    storage_user = cfg["storage_user"]
+    local_hostname = get_local_hostname_for_db()
+    
+    print(f"\nTesting database connectivity to {storage_host}...")
+    
+    success, error_type, error_msg = test_db_connectivity(cfg)
+    
+    if success:
+        print(f"  ✓ Successfully connected to database on {storage_host}")
+        return True
+    
+    print(f"  ✗ Connection failed: {error_msg}")
+    
+    if error_type == 'host_denied':
+        print(f"\n  The database user '{storage_user}' is not allowed to connect from this host.")
+        print(f"  This host appears as: {local_hostname}")
+        print(f"\n  Checking if we can fix this via SSH to {storage_host}...")
+        
+        # Check if mysql client is available on remote host
+        mysql_available, mysql_path = check_remote_mysql_client(storage_host)
+        
+        if not mysql_available:
+            print(f"\n  ✗ MySQL client not found on {storage_host}")
+            print(f"\n  To fix this, please install the mysql client package on {storage_host}:")
+            print(f"    # For Ubuntu/Debian:")
+            print(f"    ssh {storage_host} 'apt-get update && apt-get install -y mariadb-client'")
+            print(f"    # For RHEL/Rocky:")
+            print(f"    ssh {storage_host} 'dnf install -y mariadb'")
+            print(f"\n  Then run this script again.")
+            return False
+        
+        print(f"  ✓ MySQL client found at: {mysql_path}")
+        
+        # Ask user for confirmation before modifying remote DB
+        answer = input(f"\n  Update database permissions on {storage_host} to allow connections from this host? [y/N]: ").strip().lower()
+        if answer not in ('y', 'yes'):
+            print("  Aborting. Please fix database permissions manually.")
+            return False
+        
+        # Try to fix permissions
+        if fix_remote_db_permissions(cfg, mysql_path):
+            # Test connectivity again
+            print(f"\n  Re-testing database connectivity...")
+            success, _, error_msg = test_db_connectivity(cfg)
+            if success:
+                print(f"  ✓ Successfully connected to database after permission fix!")
+                return True
+            else:
+                print(f"  ✗ Still cannot connect: {error_msg}")
+                return False
+        else:
+            return False
+    
+    elif error_type == 'auth_failed':
+        print(f"\n  ✗ Authentication failed. Check StorageUser/StoragePass in slurmdbd.conf")
+        return False
+    
+    elif error_type == 'connection_failed':
+        print(f"\n  ✗ Cannot connect to MySQL server on {storage_host}")
+        print(f"    Verify the MySQL/MariaDB service is running and accessible.")
+        return False
+    
+    else:
+        print(f"\n  ✗ Unknown error connecting to database")
+        return False
+
+
 def run_cmsh(cmsh_commands: str, check: bool = True) -> subprocess.CompletedProcess:
     """Run cmsh commands and return the result.
     
@@ -564,6 +829,15 @@ def main():
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     dump_dir = Path("/root/slurm-db-migration")
     dump_path = dump_dir / f"slurm_acct_db-{ts}.sql"
+
+    # Step 0: Ensure database connectivity
+    print(f"\n{'=' * 65}")
+    print("CHECKING DATABASE CONNECTIVITY")
+    print('=' * 65)
+    
+    if not ensure_db_connectivity(cfg):
+        print("\nERROR: Cannot establish database connectivity. Aborting.", file=sys.stderr)
+        sys.exit(1)
 
     # Step 1-3: Database migration
     print(f"\n{'=' * 65}")
