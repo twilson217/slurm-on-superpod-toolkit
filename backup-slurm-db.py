@@ -484,8 +484,11 @@ class SlurmDatabaseBackup:
                 elif line.lower() in ('no', 'false'):
                     pass  # all_head_nodes stays False
                 elif line and line.lower() not in ('yes', 'no', 'true', 'false'):
-                    # This is a node list
-                    overlay_nodes = [n.strip() for n in line.split(',') if n.strip()]
+                    # Could be comma-separated or one node per line - handle both
+                    for node in line.split(','):
+                        node = node.strip()
+                        if node:
+                            overlay_nodes.append(node)
             
             if all_head_nodes:
                 # Get all head nodes
