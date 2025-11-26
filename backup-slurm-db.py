@@ -536,18 +536,55 @@ class SlurmDatabaseBackup:
         try:
             start_time = time.time()
             
-            # Progress tracking with elapsed time spinner
+            # Progress tracking with elapsed time spinner and DB status
             restore_complete = [False]
+            last_table_count = [0]
+            
+            def get_table_count():
+                """Query database for current table count"""
+                try:
+                    check_cmd = [
+                        'mysql',
+                        '-h', self.db_config['storage_host'],
+                        '-u', self.db_config['storage_user'],
+                        f"-p{self.db_config['storage_pass']}",
+                        '-N', '-e',
+                        f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='{self.db_config['storage_loc']}';"
+                    ]
+                    result = subprocess.run(check_cmd, capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0:
+                        return int(result.stdout.strip())
+                except:
+                    pass
+                return 0
             
             def show_elapsed():
                 """Show elapsed time while restore runs"""
                 spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
                 spin_idx = 0
+                check_interval = 50  # Check DB every 5 seconds (50 * 0.1s)
+                check_counter = 0
+                
                 while not restore_complete[0]:
                     elapsed = time.time() - start_time
                     mins = int(elapsed // 60)
                     secs = int(elapsed % 60)
-                    sys.stdout.write(f"\r  {spinner[spin_idx]} Importing... {mins:02d}:{secs:02d} elapsed   ")
+                    
+                    # Periodically check table count to verify progress
+                    check_counter += 1
+                    if check_counter >= check_interval:
+                        check_counter = 0
+                        count = get_table_count()
+                        if count > 0:
+                            last_table_count[0] = count
+                    
+                    # Show status with table count if available
+                    if last_table_count[0] > 0:
+                        status = f"\r  {spinner[spin_idx]} Importing... {mins:02d}:{secs:02d} elapsed | {last_table_count[0]} tables   "
+                    else:
+                        status = f"\r  {spinner[spin_idx]} Importing... {mins:02d}:{secs:02d} elapsed   "
+                    
+                    sys.stdout.write(status)
                     sys.stdout.flush()
                     spin_idx = (spin_idx + 1) % len(spinner)
                     time.sleep(0.1)
