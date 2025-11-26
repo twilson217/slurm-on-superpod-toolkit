@@ -536,122 +536,82 @@ class SlurmDatabaseBackup:
         try:
             start_time = time.time()
             
-            # Check if pv (pipe viewer) is available for progress display
-            pv_available = subprocess.run(
-                ['which', 'pv'], 
-                capture_output=True
-            ).returncode == 0
+            # Progress tracking with elapsed time spinner
+            restore_complete = [False]
             
-            # Check if we have a real tty for pv to work
-            has_tty = os.path.exists('/dev/tty') and os.isatty(sys.stderr.fileno())
-            
-            if pv_available and has_tty:
-                # Use pv for nice progress display (requires real terminal)
-                self.log("  (Note: You may see a MySQL password warning - this is normal)\n")
-                sys.stdout.flush()
-                sys.stderr.flush()
-                
-                if is_compressed:
-                    shell_cmd = (
-                        f"zcat '{backup_file}' | pv | "
-                        f"mysql -h {self.db_config['storage_host']} "
-                        f"-u {self.db_config['storage_user']} "
-                        f"-p'{self.db_config['storage_pass']}' "
-                        f"{self.db_config['storage_loc']}"
-                    )
-                else:
-                    shell_cmd = (
-                        f"pv '{backup_file}' | "
-                        f"mysql -h {self.db_config['storage_host']} "
-                        f"-u {self.db_config['storage_user']} "
-                        f"-p'{self.db_config['storage_pass']}' "
-                        f"{self.db_config['storage_loc']}"
-                    )
-                
-                returncode = os.system(shell_cmd)
-                
-                if returncode != 0:
-                    self.log(f"\nERROR: Restore failed (exit code {returncode})", Colors.RED)
-                    return False
-            else:
-                # Fallback: no pv, use simple approach with elapsed time display
-                self.log("  (Install 'pv' package for better progress display)")
-                self.log("")
-                
-                # Progress tracking with elapsed time
-                restore_complete = [False]
-                
-                def show_elapsed():
-                    """Show elapsed time while restore runs"""
-                    spinner = ['|', '/', '-', '\\']
-                    spin_idx = 0
-                    while not restore_complete[0]:
-                        elapsed = time.time() - start_time
-                        mins = int(elapsed // 60)
-                        secs = int(elapsed % 60)
-                        sys.stdout.write(f"\r  {spinner[spin_idx]} Importing... {mins:02d}:{secs:02d} elapsed")
-                        sys.stdout.flush()
-                        spin_idx = (spin_idx + 1) % 4
-                        time.sleep(0.5)
-                    sys.stdout.write("\n")
+            def show_elapsed():
+                """Show elapsed time while restore runs"""
+                spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+                spin_idx = 0
+                while not restore_complete[0]:
+                    elapsed = time.time() - start_time
+                    mins = int(elapsed // 60)
+                    secs = int(elapsed % 60)
+                    sys.stdout.write(f"\r  {spinner[spin_idx]} Importing... {mins:02d}:{secs:02d} elapsed   ")
                     sys.stdout.flush()
+                    spin_idx = (spin_idx + 1) % len(spinner)
+                    time.sleep(0.1)
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            
+            # Start elapsed time display thread
+            elapsed_thread = threading.Thread(target=show_elapsed, daemon=True)
+            elapsed_thread.start()
+            
+            if is_compressed:
+                # Decompress and pipe to mysql
+                zcat_process = subprocess.Popen(
+                    ['zcat', backup_file],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
                 
-                # Start elapsed time display
-                elapsed_thread = threading.Thread(target=show_elapsed, daemon=True)
-                elapsed_thread.start()
+                mysql_process = subprocess.Popen(
+                    restore_cmd,
+                    stdin=zcat_process.stdout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
                 
-                if is_compressed:
-                    # Decompress and pipe to mysql
-                    zcat_process = subprocess.Popen(
-                        ['zcat', backup_file],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE
-                    )
-                    
-                    mysql_process = subprocess.Popen(
-                        restore_cmd,
-                        stdin=zcat_process.stdout,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True
-                    )
-                    
-                    zcat_process.stdout.close()
-                    mysql_stdout, mysql_stderr = mysql_process.communicate()
-                    zcat_process.wait()
-                    
-                    restore_complete[0] = True
-                    elapsed_thread.join(timeout=2)
-                    
-                    if zcat_process.returncode != 0:
-                        self.log("ERROR: Failed to decompress backup file", Colors.RED)
+                zcat_process.stdout.close()
+                mysql_stdout, mysql_stderr = mysql_process.communicate()
+                zcat_process.wait()
+                
+                restore_complete[0] = True
+                elapsed_thread.join(timeout=2)
+                
+                if zcat_process.returncode != 0:
+                    self.log("ERROR: Failed to decompress backup file", Colors.RED)
+                    return False
+                
+                if mysql_process.returncode != 0:
+                    stderr = '\n'.join([l for l in mysql_stderr.split('\n') 
+                                       if 'password on the command line' not in l.lower()])
+                    if stderr.strip():
+                        self.log(f"ERROR: MySQL restore failed: {stderr}", Colors.RED)
                         return False
-                    
-                    if mysql_process.returncode != 0:
-                        stderr = '\n'.join([l for l in mysql_stderr.split('\n') 
-                                           if 'password on the command line' not in l.lower()])
-                        if stderr.strip():
-                            self.log(f"ERROR: MySQL restore failed: {stderr}", Colors.RED)
-                            return False
-                else:
-                    # Plain SQL file
-                    with open(backup_file, 'r') as f:
-                        result = subprocess.run(
-                            restore_cmd,
-                            stdin=f,
-                            capture_output=True,
-                            text=True
-                        )
-                    
-                    restore_complete[0] = True
-                    elapsed_thread.join(timeout=2)
-                    
-                    if result.returncode != 0:
-                        stderr = '\n'.join([l for l in result.stderr.split('\n') 
-                                           if 'password on the command line' not in l.lower()])
-                        if stderr.strip():
-                            self.log(f"ERROR: MySQL restore failed: {stderr}", Colors.RED)
-                            return False
+            else:
+                # Plain SQL file
+                mysql_process = subprocess.Popen(
+                    restore_cmd,
+                    stdin=open(backup_file, 'r'),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                
+                mysql_stdout, mysql_stderr = mysql_process.communicate()
+                
+                restore_complete[0] = True
+                elapsed_thread.join(timeout=2)
+                
+                if mysql_process.returncode != 0:
+                    stderr = '\n'.join([l for l in mysql_stderr.split('\n') 
+                                       if 'password on the command line' not in l.lower()])
+                    if stderr.strip():
+                        self.log(f"ERROR: MySQL restore failed: {stderr}", Colors.RED)
+                        return False
             
             # Show completion stats
             total_time = time.time() - start_time
