@@ -413,6 +413,148 @@ class SlurmDatabaseBackup:
         
         return all_passed
     
+    def _prepare_for_restore(self) -> bool:
+        """Prepare the database for restore by stopping slurmdbd and killing connections.
+        
+        Returns:
+            True if ready to proceed, False if preparation failed
+        """
+        self.log(f"\n{Colors.BOLD}Preparing database for restore...{Colors.RESET}")
+        
+        storage_host = self.db_config['storage_host']
+        storage_user = self.db_config['storage_user']
+        storage_pass = self.db_config['storage_pass']
+        storage_loc = self.db_config['storage_loc']
+        
+        # Find nodes running slurmdbd using cmsh
+        slurmdbd_nodes = []
+        try:
+            cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+            if os.path.exists(cmsh_path):
+                result = subprocess.run(
+                    [cmsh_path, '-c', 'device; foreach -r slurmaccounting (get hostname)'],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.strip().split('\n'):
+                        line = line.strip()
+                        if line:
+                            slurmdbd_nodes.append(line)
+        except Exception as e:
+            self.log(f"  Warning: Could not discover slurmdbd nodes via cmsh: {e}", Colors.YELLOW)
+        
+        # Check which nodes have slurmdbd running
+        nodes_with_slurmdbd = []
+        for node in slurmdbd_nodes:
+            try:
+                result = subprocess.run(
+                    ['ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                     node, 'systemctl is-active slurmdbd'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0 and 'active' in result.stdout:
+                    nodes_with_slurmdbd.append(node)
+            except:
+                pass
+        
+        # Stop slurmdbd if running
+        if nodes_with_slurmdbd:
+            self.log(f"  Found slurmdbd running on: {', '.join(nodes_with_slurmdbd)}")
+            answer = input(f"  Stop slurmdbd on these nodes before restore? [Y/n]: ").strip().lower()
+            if answer not in ('n', 'no'):
+                for node in nodes_with_slurmdbd:
+                    self.log(f"    Stopping slurmdbd on {node}...")
+                    try:
+                        result = subprocess.run(
+                            ['ssh', '-o', 'ConnectTimeout=5', node, 'systemctl stop slurmdbd'],
+                            capture_output=True,
+                            text=True,
+                            timeout=30
+                        )
+                        if result.returncode == 0:
+                            self.log(f"    {Colors.GREEN}✓{Colors.RESET} Stopped slurmdbd on {node}")
+                        else:
+                            self.log(f"    {Colors.YELLOW}⚠{Colors.RESET} Could not stop slurmdbd on {node}: {result.stderr.strip()}")
+                    except Exception as e:
+                        self.log(f"    {Colors.YELLOW}⚠{Colors.RESET} Error stopping slurmdbd on {node}: {e}")
+                # Give services time to fully stop
+                time.sleep(2)
+        else:
+            self.log(f"  {Colors.GREEN}✓{Colors.RESET} No slurmdbd services found running")
+        
+        # Check for blocking database connections
+        self.log(f"\n  Checking for blocking database connections...")
+        blocking_connections = []
+        
+        try:
+            # Query processlist for connections to our database
+            check_cmd = [
+                'mysql',
+                '-h', storage_host,
+                '-u', storage_user,
+                f"-p{storage_pass}",
+                '-N', '-e',
+                f"SELECT Id, User, Host, db, Command, Time FROM information_schema.processlist "
+                f"WHERE db = '{storage_loc}' AND Command != 'Query' AND Id != CONNECTION_ID();"
+            ]
+            result = subprocess.run(check_cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                for line in result.stdout.strip().split('\n'):
+                    parts = line.split('\t')
+                    if len(parts) >= 4:
+                        conn_id = parts[0]
+                        conn_user = parts[1]
+                        conn_host = parts[2]
+                        conn_time = parts[5] if len(parts) > 5 else '0'
+                        blocking_connections.append({
+                            'id': conn_id,
+                            'user': conn_user,
+                            'host': conn_host,
+                            'time': conn_time
+                        })
+        except Exception as e:
+            self.log(f"  Warning: Could not check for blocking connections: {e}", Colors.YELLOW)
+        
+        # Kill blocking connections
+        if blocking_connections:
+            self.log(f"  Found {len(blocking_connections)} connection(s) that may block restore:")
+            for conn in blocking_connections:
+                self.log(f"    - ID {conn['id']}: {conn['user']}@{conn['host']} (idle {conn['time']}s)")
+            
+            answer = input(f"  Kill these connections to proceed? [Y/n]: ").strip().lower()
+            if answer not in ('n', 'no'):
+                for conn in blocking_connections:
+                    try:
+                        kill_cmd = [
+                            'mysql',
+                            '-h', storage_host,
+                            '-u', storage_user,
+                            f"-p{storage_pass}",
+                            '-e', f"KILL {conn['id']};"
+                        ]
+                        result = subprocess.run(kill_cmd, capture_output=True, text=True, timeout=10)
+                        if result.returncode == 0:
+                            self.log(f"    {Colors.GREEN}✓{Colors.RESET} Killed connection {conn['id']}")
+                        else:
+                            # Connection may have already closed
+                            self.log(f"    {Colors.YELLOW}⚠{Colors.RESET} Connection {conn['id']} already closed or could not kill")
+                    except Exception as e:
+                        self.log(f"    {Colors.YELLOW}⚠{Colors.RESET} Error killing connection {conn['id']}: {e}")
+                # Give a moment for connections to fully close
+                time.sleep(1)
+            else:
+                self.log(f"\n{Colors.YELLOW}Warning: Restore may hang waiting for locks.{Colors.RESET}")
+        else:
+            self.log(f"  {Colors.GREEN}✓{Colors.RESET} No blocking connections found")
+        
+        self.log(f"\n  {Colors.GREEN}✓{Colors.RESET} Database ready for restore")
+        return True
+    
     def restore_backup(self, backup_file: str, force: bool = False) -> bool:
         """Restore database from a backup file.
         
@@ -488,6 +630,10 @@ class SlurmDatabaseBackup:
             if answer not in ('y', 'yes'):
                 self.log("\nRestore cancelled by user.")
                 return False
+        
+        # Pre-restore: Stop slurmdbd and kill blocking connections
+        if not self._prepare_for_restore():
+            return False
         
         # Build mysql command
         mysql_cmd = [
