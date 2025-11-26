@@ -542,39 +542,36 @@ class SlurmDatabaseBackup:
                 capture_output=True
             ).returncode == 0
             
-            if pv_available:
-                # Use pv for nice progress display
-                # pv shows: bytes transferred, time elapsed, rate, ETA
-                # pv outputs progress to stderr, so we must not capture stderr
-                
+            # Check if we have a real tty for pv to work
+            has_tty = os.path.exists('/dev/tty') and os.isatty(sys.stderr.fileno())
+            
+            if pv_available and has_tty:
+                # Use pv for nice progress display (requires real terminal)
                 self.log("  (Note: You may see a MySQL password warning - this is normal)\n")
+                sys.stdout.flush()
+                sys.stderr.flush()
                 
                 if is_compressed:
-                    # zcat file.gz | pv | mysql ...
-                    cmd = [
-                        'bash', '-c',
-                        f"zcat '{backup_file}' | pv -f | "
+                    shell_cmd = (
+                        f"zcat '{backup_file}' | pv | "
                         f"mysql -h {self.db_config['storage_host']} "
                         f"-u {self.db_config['storage_user']} "
                         f"-p'{self.db_config['storage_pass']}' "
                         f"{self.db_config['storage_loc']}"
-                    ]
+                    )
                 else:
-                    # pv file.sql | mysql ...
-                    cmd = [
-                        'bash', '-c',
-                        f"pv -f '{backup_file}' | "
+                    shell_cmd = (
+                        f"pv '{backup_file}' | "
                         f"mysql -h {self.db_config['storage_host']} "
                         f"-u {self.db_config['storage_user']} "
                         f"-p'{self.db_config['storage_pass']}' "
                         f"{self.db_config['storage_loc']}"
-                    ]
+                    )
                 
-                # Run the pipeline - stderr goes to terminal (for pv progress)
-                result = subprocess.run(cmd)
+                returncode = os.system(shell_cmd)
                 
-                if result.returncode != 0:
-                    self.log(f"\nERROR: Restore failed (exit code {result.returncode})", Colors.RED)
+                if returncode != 0:
+                    self.log(f"\nERROR: Restore failed (exit code {returncode})", Colors.RED)
                     return False
             else:
                 # Fallback: no pv, use simple approach with elapsed time display
