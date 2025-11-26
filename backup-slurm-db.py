@@ -545,42 +545,37 @@ class SlurmDatabaseBackup:
             if pv_available:
                 # Use pv for nice progress display
                 # pv shows: bytes transferred, time elapsed, rate, ETA
+                # pv outputs progress to stderr, so we must not capture stderr
+                
+                self.log("  (Note: You may see a MySQL password warning - this is normal)\n")
+                
                 if is_compressed:
                     # zcat file.gz | pv | mysql ...
-                    # Use shell pipeline for simplicity
-                    shell_cmd = (
-                        f"zcat '{backup_file}' | pv -f -N 'Importing' | "
+                    cmd = [
+                        'bash', '-c',
+                        f"zcat '{backup_file}' | pv -f | "
                         f"mysql -h {self.db_config['storage_host']} "
                         f"-u {self.db_config['storage_user']} "
                         f"-p'{self.db_config['storage_pass']}' "
                         f"{self.db_config['storage_loc']}"
-                    )
+                    ]
                 else:
                     # pv file.sql | mysql ...
-                    shell_cmd = (
-                        f"pv -f -N 'Importing' '{backup_file}' | "
+                    cmd = [
+                        'bash', '-c',
+                        f"pv -f '{backup_file}' | "
                         f"mysql -h {self.db_config['storage_host']} "
                         f"-u {self.db_config['storage_user']} "
                         f"-p'{self.db_config['storage_pass']}' "
                         f"{self.db_config['storage_loc']}"
-                    )
+                    ]
                 
-                # Run the pipeline
-                result = subprocess.run(
-                    shell_cmd,
-                    shell=True,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
+                # Run the pipeline - stderr goes to terminal (for pv progress)
+                result = subprocess.run(cmd)
                 
                 if result.returncode != 0:
-                    # Filter out password warning from stderr
-                    stderr = '\n'.join([l for l in result.stderr.split('\n') 
-                                       if 'password on the command line' not in l.lower()
-                                       and 'Importing:' not in l])  # pv output goes to stderr
-                    if stderr.strip():
-                        self.log(f"\nERROR: MySQL restore failed: {stderr}", Colors.RED)
-                        return False
+                    self.log(f"\nERROR: Restore failed (exit code {result.returncode})", Colors.RED)
+                    return False
             else:
                 # Fallback: no pv, use simple approach with elapsed time display
                 self.log("  (Install 'pv' package for better progress display)")
