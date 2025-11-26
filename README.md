@@ -49,7 +49,9 @@ Migrate Slurm accounting database from dedicated controllers to BCM head nodes. 
 **What it does:**
 1. Dumps database from current `StorageHost`
 2. Imports into local MariaDB on BCM head node
-3. Updates `slurmaccounting` role via cmsh (primary, storagehost)
+3. Updates `slurmaccounting` role via cmsh:
+   - `primary` → active BCM head node hostname
+   - `storagehost` → `master` (BCM HA virtual hostname)
 4. Updates overlay to use `allheadnodes yes`
 5. Restarts slurmdbd services
 

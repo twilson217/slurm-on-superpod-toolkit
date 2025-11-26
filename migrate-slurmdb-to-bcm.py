@@ -9,7 +9,8 @@ It will:
   3. Import that dump into the local MariaDB/MySQL instance on the BCM head
   4. Automatically update BCM configuration via cmsh:
      - Find the configuration overlay with the slurmaccounting role
-     - Update the role's primary and storagehost to point to BCM head node
+     - Update the role's primary to the active BCM head node
+     - Update the role's storagehost to "master" (BCM HA virtual hostname)
      - Update the overlay to use "allheadnodes yes" instead of specific nodes
 
 After running this script:
@@ -232,7 +233,7 @@ def update_bcm_configuration(primary_headnode: str, skip_confirm: bool = False) 
     1. Finds the configuration overlay with slurmaccounting role
     2. Updates the slurmaccounting role:
        - Sets 'primary' to the primary BCM head node
-       - Sets 'storagehost' to the primary BCM head node
+       - Sets 'storagehost' to 'master' (BCM HA virtual hostname for active head)
     3. Updates the configuration overlay:
        - Clears the 'nodes' setting
        - Sets 'allheadnodes' to yes
@@ -305,7 +306,7 @@ quit
     print(f"    allheadnodes  : yes")
     print(f"  Role: slurmaccounting")
     print(f"    primary       : {primary_headnode}")
-    print(f"    storagehost   : {primary_headnode}")
+    print(f"    storagehost   : master  (BCM HA virtual hostname)")
     
     if not skip_confirm:
         answer = input("\nApply these BCM configuration changes? [y/N]: ").strip().lower()
@@ -314,12 +315,14 @@ quit
             return False
     
     # Build cmsh commands to update configuration
+    # Note: storagehost is set to "master" which is the BCM HA virtual hostname
+    # that always points to the active head node
     cmsh_update = f"""configurationoverlay
 use {overlay_name}
 roles
 use slurmaccounting
 set primary {primary_headnode}
-set storagehost {primary_headnode}
+set storagehost master
 commit
 exit
 set nodes
@@ -331,7 +334,7 @@ quit
     print("\nApplying BCM configuration changes...")
     try:
         result = run_cmsh(cmsh_update)
-        print(f"  ✓ Updated slurmaccounting role: primary={primary_headnode}, storagehost={primary_headnode}")
+        print(f"  ✓ Updated slurmaccounting role: primary={primary_headnode}, storagehost=master")
         print(f"  ✓ Updated overlay: allheadnodes=yes, nodes cleared")
         return True
     except Exception as e:
@@ -530,7 +533,8 @@ def main():
         f"  2) Import that dump into local MariaDB/MySQL on this head node ({local_hostname})\n"
         "  3) Grant the Slurm DB user access to the local database\n"
         "  4) Update BCM configuration via cmsh:\n"
-        f"     - Set slurmaccounting role's primary and storagehost to {primary_headnode}\n"
+        f"     - Set slurmaccounting role's primary to {primary_headnode}\n"
+        "     - Set slurmaccounting role's storagehost to 'master' (BCM HA virtual hostname)\n"
         "     - Update overlay to use 'allheadnodes yes' (remove specific node assignments)\n"
         "  5) Restart slurmdbd services on head nodes\n"
         "\nAfter migration, the Slurm accounting database will be hosted on the BCM\n"
@@ -594,13 +598,13 @@ def main():
     if bcm_updated:
         print(f"\n✓ BCM configuration updated:")
         print(f"    slurmaccounting primary: {primary_headnode}")
-        print(f"    slurmaccounting storagehost: {primary_headnode}")
+        print(f"    slurmaccounting storagehost: master")
         print(f"    overlay allheadnodes: yes")
     else:
         print(f"\n⚠ BCM configuration was NOT updated automatically.")
         print("  You must manually update via cmsh:")
         print(f"    cmsh -c 'configurationoverlay; use <overlay>; roles; use slurmaccounting; "
-              f"set primary {primary_headnode}; set storagehost {primary_headnode}; commit; "
+              f"set primary {primary_headnode}; set storagehost master; commit; "
               f"exit; set nodes; set allheadnodes yes; commit'")
     
     print("\nNext steps:")
