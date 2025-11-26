@@ -1208,7 +1208,7 @@ def import_db_to_local(cfg, dump_path: Path):
     # Ensure the password is set correctly even if user already existed
     # This is critical when migrating to BCM head nodes where the slurm user
     # may already exist with a different password
-    print("  Ensuring Slurm DB user password matches slurmdbd.conf...")
+    print("  Ensuring Slurm DB user password matches slurmdbd.conf on local node...")
     alter_sql = f"ALTER USER '{storage_user}'@'%' IDENTIFIED BY '{storage_pass}'; FLUSH PRIVILEGES;"
     result = subprocess.run(
         mysql_base + ["-e", alter_sql],
@@ -1217,11 +1217,34 @@ def import_db_to_local(cfg, dump_path: Path):
         text=True,
     )
     if result.returncode == 0:
-        print(f"  ✓ Slurm DB user password updated to match slurmdbd.conf")
+        print(f"  ✓ Slurm DB user password updated on local node")
     else:
-        print(f"  ⚠ Warning: Could not update password: {result.stderr}")
+        print(f"  ⚠ Warning: Could not update password on local node: {result.stderr}")
         print(f"    You may need to manually run:")
         print(f"    mysql -e \"ALTER USER '{storage_user}'@'%' IDENTIFIED BY '<password>'; FLUSH PRIVILEGES;\"")
+    
+    # Also update password on the secondary head node (required for cmha dbreclone to work)
+    _, secondary_headnode = get_bcm_headnodes()
+    if secondary_headnode:
+        print(f"  Ensuring Slurm DB user password matches on secondary node ({secondary_headnode})...")
+        # Use ssh to run the ALTER USER on the secondary node
+        ssh_cmd = [
+            "ssh", secondary_headnode,
+            f"mysql -e \"ALTER USER '{storage_user}'@'%' IDENTIFIED BY '{storage_pass}'; FLUSH PRIVILEGES;\""
+        ]
+        result = subprocess.run(
+            ssh_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            print(f"  ✓ Slurm DB user password updated on secondary node ({secondary_headnode})")
+        else:
+            print(f"  ⚠ Warning: Could not update password on {secondary_headnode}: {result.stderr}")
+            print(f"    You may need to manually run on {secondary_headnode}:")
+            print(f"    mysql -e \"ALTER USER '{storage_user}'@'%' IDENTIFIED BY '<password>'; FLUSH PRIVILEGES;\"")
 
 
 def start_slurmdbd_services():
