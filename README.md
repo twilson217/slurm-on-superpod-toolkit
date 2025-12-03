@@ -4,15 +4,15 @@ Tools for managing Slurm upgrades, healthchecks, backups, and migrations in BCM-
 
 ## Scripts
 
-### `slurm-healthcheck.py`
+### `healthcheck-slurm.py`
 
 Comprehensive health validation for Slurm clusters. Run before/after upgrades to verify cluster state.
 
 ```bash
-./slurm-healthcheck.py                    # Full healthcheck
-./slurm-healthcheck.py --maint            # Skip job submission tests (maintenance mode)
-./slurm-healthcheck.py --pre-upgrade      # Capture baseline before upgrade
-./slurm-healthcheck.py --post-upgrade     # Compare against baseline after upgrade
+./healthcheck-slurm.py                    # Full healthcheck
+./healthcheck-slurm.py --maint            # Skip job submission tests (maintenance mode)
+./healthcheck-slurm.py --pre-upgrade      # Capture baseline before upgrade
+./healthcheck-slurm.py --post-upgrade     # Compare against baseline after upgrade
 ```
 
 **Features:** Service status, node health, HA validation, partition checks, Pyxis/Enroot, GPU/GRES, log analysis, database backup validation.
@@ -82,7 +82,7 @@ Comprehensive backup of Slurm-related files from BCM clusters. Includes systemd 
 ## Directory Structure
 
 ```
-├── slurm-healthcheck.py        # Cluster health validation
+├── healthcheck-slurm.py        # Cluster health validation
 ├── backup-slurm-db.py          # DB backup/restore
 ├── backup-slurm-files.py       # Slurm files backup/restore
 ├── migrate-slurmdb-to-bcm.py   # DB migration to BCM heads
@@ -102,12 +102,12 @@ Comprehensive backup of Slurm-related files from BCM clusters. Includes systemd 
 
 ## Typical Upgrade Workflow
 
-1. **Pre-upgrade:** `./slurm-healthcheck.py --pre-upgrade`
+1. **Pre-upgrade:** `./healthcheck-slurm.py --pre-upgrade`
 2. **Backup DB:** `./backup-slurm-db.py -o /root/slurm-upgrade-backups`
 3. **Backup files:** `./backup-slurm-files.py -o /root/slurm-upgrade-backups`
 4. **Perform upgrade** (follow `plans/slurm-upgrade-23.11-to-25.05-plan.md`)
 5. **Restore missing files:** `./backup-slurm-files.py --restore /root/slurm-upgrade-backups/slurm-files-*`
-6. **Post-upgrade:** `./slurm-healthcheck.py --post-upgrade`
+6. **Post-upgrade:** `./healthcheck-slurm.py --post-upgrade`
 
 ## Troubleshooting
 

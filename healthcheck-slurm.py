@@ -6,11 +6,11 @@ Comprehensive healthcheck tool for validating Slurm cluster health before and af
 Supports baseline capture, post-upgrade comparison, and detailed validation of all components.
 
 Usage:
-    ./slurm-healthcheck.py                                    # Run standard healthcheck
-    ./slurm-healthcheck.py --pre-upgrade -o baseline.json     # Capture pre-upgrade baseline
-    ./slurm-healthcheck.py --post-upgrade -b baseline.json    # Compare post-upgrade to baseline
-    ./slurm-healthcheck.py -v                                 # Verbose output
-    ./slurm-healthcheck.py --json                             # JSON output format
+    ./healthcheck-slurm.py                                    # Run standard healthcheck
+    ./healthcheck-slurm.py --pre-upgrade -o baseline.json     # Capture pre-upgrade baseline
+    ./healthcheck-slurm.py --post-upgrade -b baseline.json    # Compare post-upgrade to baseline
+    ./healthcheck-slurm.py -v                                 # Verbose output
+    ./healthcheck-slurm.py --json                             # JSON output format
 """
 
 import argparse
