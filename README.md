@@ -15,7 +15,9 @@ Comprehensive health validation for Slurm clusters. Run before/after upgrades to
 ./healthcheck-slurm.py --post-upgrade     # Compare against baseline after upgrade
 ```
 
-**Features:** Service status, node health, HA validation, partition checks, Pyxis/Enroot, GPU/GRES, log analysis, database backup validation.
+**Features:** Service status, node health, HA validation (including BCM cmha MySQL HA), partition checks, Pyxis/Enroot, GPU/GRES, log analysis, database backup validation.
+
+**Accounting Discovery:** Automatically discovers accounting nodes even when using `allheadnodes yes` overlay configuration. Uses `cmha status` for BCM head node MySQL HA validation.
 
 **Config:** `healthcheck-config.conf`
 
@@ -43,7 +45,11 @@ Backup and restore the Slurm accounting database. Reads connection details from 
 Migrate Slurm accounting database from dedicated controllers to BCM head nodes. Automatically updates BCM configuration via cmsh.
 
 ```bash
-./migrate-slurmdb-to-bcm.py
+./migrate-slurmdb-to-bcm.py                    # Full migration
+./migrate-slurmdb-to-bcm.py --reupdate-primary # Re-run cmdaemon DB update only
+./migrate-slurmdb-to-bcm.py --rollback \       # Rollback to original controllers
+    --original-primary slurmctl-01 \
+    --original-backup slurmctl-02
 ```
 
 **What it does:**
@@ -53,7 +59,13 @@ Migrate Slurm accounting database from dedicated controllers to BCM head nodes. 
    - `primary` → active BCM head node hostname
    - `storagehost` → `master` (BCM HA virtual hostname)
 4. Updates overlay to use `allheadnodes yes`
-5. Restarts slurmdbd services
+5. Creates systemd drop-in file on both head nodes (clears `ConditionPathExists` check)
+
+**Options:**
+- `--reupdate-primary` — Re-run only the cmdaemon database update for the slurmaccounting primary. Useful if the primary field wasn't properly updated during initial migration.
+- `--rollback` — Revert BCM configuration to use original Slurm controllers. Requires `--original-primary` and optionally `--original-backup`.
+
+**Manual procedure:** See `plans/migrate-slurmdb-to-bcm.md` for step-by-step manual instructions.
 
 ---
 
@@ -87,9 +99,10 @@ Comprehensive backup of Slurm-related files from BCM clusters. Includes systemd 
 ├── backup-slurm-files.py       # Slurm files backup/restore
 ├── migrate-slurmdb-to-bcm.py   # DB migration to BCM heads
 ├── healthcheck-config.conf     # Healthcheck configuration
-├── plans/                      # Upgrade and healthcheck plans
+├── plans/                      # Upgrade, migration, and healthcheck plans
 │   ├── slurm-upgrade-23.11-to-25.05-plan.md
-│   └── slurm-healthcheck-plan.md
+│   ├── slurm-healthcheck-plan.md
+│   └── migrate-slurmdb-to-bcm.md  # Manual migration procedure
 └── .docs/                      # Reference documentation
 ```
 
@@ -129,6 +142,42 @@ systemctl restart slurmctld
 ```
 
 This tells slurmctld to use the cluster ID from the database instead of the cached state files.
+
+### slurmdbd Fails with "Unmet Condition"
+
+After migrating to BCM head nodes, if slurmdbd shows `ConditionPathExists=/etc/slurm/slurmdbd.conf was not met`:
+
+**Fix:** Create the systemd drop-in file (the migration script does this automatically):
+
+```bash
+mkdir -p /etc/systemd/system/slurmdbd.service.d
+cat > /etc/systemd/system/slurmdbd.service.d/99-cmd.conf << 'EOF'
+[Unit]
+ConditionPathExists=
+[Service]
+Environment=SLURM_CONF=/cm/shared/apps/slurm/var/etc/slurm/slurm.conf
+EOF
+systemctl daemon-reload
+systemctl start slurmdbd
+```
+
+### slurmdbd Fails with "This host not configured to run SlurmDBD"
+
+The slurmaccounting `primary` field in the cmdaemon database still points to the old controllers:
+
+**Fix:** Use the migration script's re-update option:
+
+```bash
+./migrate-slurmdb-to-bcm.py --reupdate-primary
+```
+
+Or manually update (must stop cmdaemon first):
+
+```bash
+systemctl stop cmd
+mysql cmdaemon -e "UPDATE Roles SET extra_values='{\"ha\":true,\"primary\":\"$(hostname -s)\"}' WHERE CAST(name AS CHAR)='slurmaccounting';"
+systemctl start cmd
+```
 
 ## License
 

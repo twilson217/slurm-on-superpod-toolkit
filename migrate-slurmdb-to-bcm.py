@@ -12,6 +12,8 @@ It will:
      - Update the role's primary to the active BCM head node
      - Update the role's storagehost to "master" (BCM HA virtual hostname)
      - Update the overlay to use "allheadnodes yes" instead of specific nodes
+  5. Ensure slurmdbd systemd drop-in file exists on both head nodes
+     (clears ConditionPathExists check that would prevent service start)
 
 After running this script:
   - The Slurm accounting database will be on the BCM head nodes
@@ -20,8 +22,13 @@ After running this script:
 
 High availability (HA) for the DB on the head nodes is provided by the
 existing BCM HA MySQL replication configured by cmha-setup.
+
+Options:
+  --reupdate-primary    Re-run only the cmdaemon database update for primary
+  --rollback            Rollback migration to original Slurm controllers
 """
 
+import argparse
 import os
 import sys
 import subprocess
@@ -637,7 +644,25 @@ quit
         # Update primary directly in cmdaemon database
         # The 'primary' field is stored as JSON in the Roles table's extra_values column
         # and is not settable via cmsh
-        print(f"\n  Updating slurmaccounting primary in cmdaemon database...")
+        #
+        # IMPORTANT: We must STOP cmdaemon before updating the database, then START it.
+        # If we update while cmdaemon is running and then restart, cmdaemon may overwrite
+        # our database change with its cached in-memory state.
+        print(f"\n  Stopping cmdaemon before database update...")
+        result = subprocess.run(
+            ["systemctl", "stop", "cmd"],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        if result.returncode == 0:
+            print(f"  ✓ cmdaemon stopped")
+            time.sleep(2)  # Give cmdaemon time to fully stop and flush state
+        else:
+            print(f"  ⚠ Warning: Could not stop cmdaemon: {result.stderr}")
+            print(f"    Proceeding with database update anyway...")
+        
+        print(f"  Updating slurmaccounting primary in cmdaemon database...")
         update_sql = (
             f"UPDATE Roles SET extra_values='{{\"ha\":true,\"primary\":\"{primary_headnode}\"}}' "
             f"WHERE CAST(name AS CHAR)='slurmaccounting'"
@@ -652,19 +677,33 @@ quit
         else:
             print(f"  ✓ Updated slurmaccounting primary={primary_headnode} in cmdaemon database")
         
-        # Restart cmdaemon to pick up the database change
-        print(f"  Restarting cmdaemon to apply changes...")
+        # Verify the update was applied
+        verify_sql = "SELECT CAST(extra_values AS CHAR) FROM Roles WHERE CAST(name AS CHAR)='slurmaccounting'"
         result = subprocess.run(
-            ["systemctl", "restart", "cmd"],
+            ["mysql", "-N", "cmdaemon", "-e", verify_sql],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            current_value = result.stdout.strip()
+            if primary_headnode in current_value:
+                print(f"  ✓ Verified: {current_value}")
+            else:
+                print(f"  ⚠ Warning: Database shows unexpected value: {current_value}")
+        
+        # Start cmdaemon to pick up the database change
+        print(f"  Starting cmdaemon...")
+        result = subprocess.run(
+            ["systemctl", "start", "cmd"],
             capture_output=True,
             text=True,
             timeout=60
         )
         if result.returncode == 0:
-            print(f"  ✓ cmdaemon restarted")
+            print(f"  ✓ cmdaemon started")
             time.sleep(5)  # Give cmdaemon time to fully start
         else:
-            print(f"  ⚠ Warning: Could not restart cmdaemon: {result.stderr}")
+            print(f"  ⚠ Warning: Could not start cmdaemon: {result.stderr}")
         
         return True
     except Exception as e:
@@ -1330,7 +1369,456 @@ def start_slurmdbd_services():
         return False
 
 
+def ensure_slurmdbd_dropin(primary_headnode: str, secondary_headnode: str) -> bool:
+    """Ensure the slurmdbd systemd drop-in file exists on both head nodes.
+    
+    The drop-in file clears the ConditionPathExists check that would otherwise
+    prevent slurmdbd from starting (since the config is not at /etc/slurm/slurmdbd.conf
+    but at /cm/shared/apps/slurm/var/etc/slurmdbd.conf).
+    
+    Args:
+        primary_headnode: Hostname of the primary BCM head node
+        secondary_headnode: Hostname of the secondary BCM head node (can be None)
+        
+    Returns:
+        True if drop-in file exists/created on all head nodes
+    """
+    print(f"\n{'=' * 65}")
+    print("CHECKING SLURMDBD SYSTEMD DROP-IN FILE")
+    print('=' * 65)
+    
+    dropin_dir = "/etc/systemd/system/slurmdbd.service.d"
+    dropin_file = f"{dropin_dir}/99-cmd.conf"
+    dropin_content = """[Unit]
+ConditionPathExists=
+[Service]
+Environment=SLURM_CONF=/cm/shared/apps/slurm/var/etc/slurm/slurm.conf
+"""
+    
+    nodes_to_check = [primary_headnode]
+    if secondary_headnode:
+        nodes_to_check.append(secondary_headnode)
+    
+    local_hostname = subprocess.run(
+        ["hostname", "-s"], capture_output=True, text=True
+    ).stdout.strip()
+    
+    all_success = True
+    
+    for node in nodes_to_check:
+        is_local = (node == local_hostname)
+        print(f"\n  Checking {node}{'  (local)' if is_local else ''}...")
+        
+        # Check if drop-in file exists
+        if is_local:
+            file_exists = os.path.exists(dropin_file)
+        else:
+            result = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+                 node, f"test -f {dropin_file}"],
+                capture_output=True, text=True, timeout=10
+            )
+            file_exists = (result.returncode == 0)
+        
+        if file_exists:
+            print(f"    ✓ Drop-in file already exists: {dropin_file}")
+            continue
+        
+        # Create the drop-in file
+        print(f"    Creating drop-in file: {dropin_file}")
+        
+        try:
+            if is_local:
+                os.makedirs(dropin_dir, exist_ok=True)
+                with open(dropin_file, 'w') as f:
+                    f.write(dropin_content)
+                # Reload systemd
+                subprocess.run(["systemctl", "daemon-reload"], check=True)
+                print(f"    ✓ Created drop-in file and reloaded systemd")
+            else:
+                # Create via SSH
+                create_cmd = (
+                    f"mkdir -p {dropin_dir} && "
+                    f"cat > {dropin_file} << 'EOF'\n{dropin_content}EOF\n"
+                    f"&& systemctl daemon-reload"
+                )
+                result = subprocess.run(
+                    ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+                     node, create_cmd],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode == 0:
+                    print(f"    ✓ Created drop-in file and reloaded systemd on {node}")
+                else:
+                    print(f"    ✗ Failed to create drop-in file on {node}: {result.stderr}")
+                    all_success = False
+        except Exception as e:
+            print(f"    ✗ Error creating drop-in file on {node}: {e}")
+            all_success = False
+    
+    return all_success
+
+
+def reupdate_primary_only():
+    """Re-run only the cmdaemon database update for the slurmaccounting primary.
+    
+    This is useful if the primary field was not properly updated during the
+    initial migration, or if it was overwritten by some other process.
+    """
+    ensure_root()
+    
+    print("=" * 65)
+    print("RE-UPDATE SLURMACCOUNTING PRIMARY")
+    print("=" * 65)
+    print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
+    # Get current values
+    primary_headnode, secondary_headnode = get_bcm_headnodes()
+    
+    print(f"BCM Head Node Information:")
+    print(f"  Primary head node    : {primary_headnode}")
+    print(f"  Secondary head node  : {secondary_headnode if secondary_headnode else '(none)'}")
+    
+    # Show current database value
+    verify_sql = "SELECT CAST(extra_values AS CHAR) FROM Roles WHERE CAST(name AS CHAR)='slurmaccounting'"
+    result = subprocess.run(
+        ["mysql", "-N", "cmdaemon", "-e", verify_sql],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        current_value = result.stdout.strip()
+        print(f"\nCurrent database value:")
+        print(f"  {current_value}")
+    
+    print(f"\nThis will update the slurmaccounting primary to: {primary_headnode}")
+    answer = input("Proceed? [y/N]: ").strip().lower()
+    if answer not in ("y", "yes"):
+        print("Aborting at user request.")
+        sys.exit(0)
+    
+    # Stop cmdaemon
+    print(f"\nStopping cmdaemon...")
+    result = subprocess.run(
+        ["systemctl", "stop", "cmd"],
+        capture_output=True, text=True, timeout=60
+    )
+    if result.returncode == 0:
+        print(f"  ✓ cmdaemon stopped")
+        time.sleep(2)
+    else:
+        print(f"  ⚠ Warning: Could not stop cmdaemon: {result.stderr}")
+    
+    # Update database
+    print(f"\nUpdating slurmaccounting primary in cmdaemon database...")
+    update_sql = (
+        f"UPDATE Roles SET extra_values='{{\"ha\":true,\"primary\":\"{primary_headnode}\"}}' "
+        f"WHERE CAST(name AS CHAR)='slurmaccounting'"
+    )
+    result = subprocess.run(
+        ["mysql", "cmdaemon", "-e", update_sql],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"  ✗ Failed to update: {result.stderr}")
+        # Try to start cmdaemon anyway
+        subprocess.run(["systemctl", "start", "cmd"], timeout=60)
+        sys.exit(1)
+    
+    print(f"  ✓ Updated slurmaccounting primary={primary_headnode}")
+    
+    # Verify
+    result = subprocess.run(
+        ["mysql", "-N", "cmdaemon", "-e", verify_sql],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        current_value = result.stdout.strip()
+        if primary_headnode in current_value:
+            print(f"  ✓ Verified: {current_value}")
+        else:
+            print(f"  ⚠ Warning: Unexpected value: {current_value}")
+    
+    # Start cmdaemon
+    print(f"\nStarting cmdaemon...")
+    result = subprocess.run(
+        ["systemctl", "start", "cmd"],
+        capture_output=True, text=True, timeout=60
+    )
+    if result.returncode == 0:
+        print(f"  ✓ cmdaemon started")
+        time.sleep(3)
+    else:
+        print(f"  ⚠ Warning: Could not start cmdaemon: {result.stderr}")
+    
+    # Verify via cmsh
+    print(f"\nVerifying via cmsh...")
+    try:
+        cmsh_result = subprocess.run(
+            ["/cm/local/apps/cmd/bin/cmsh", "-c",
+             "configurationoverlay; use slurm-accounting; roles; use slurmaccounting; get primary"],
+            capture_output=True, text=True, timeout=30
+        )
+        if cmsh_result.returncode == 0:
+            print(f"  cmsh shows: {cmsh_result.stdout.strip()}")
+    except Exception as e:
+        print(f"  Could not verify via cmsh: {e}")
+    
+    # Also ensure drop-in files exist
+    ensure_slurmdbd_dropin(primary_headnode, secondary_headnode)
+    
+    print(f"\n{'=' * 65}")
+    print("RE-UPDATE COMPLETE")
+    print('=' * 65)
+    print("\nNext steps:")
+    print("  1) Run 'cmha dbreclone <passive-node>' to sync cmdaemon database")
+    print("  2) Restart slurmdbd: systemctl restart slurmdbd")
+
+
+def rollback_migration(original_primary: str, original_backup: str = None):
+    """Rollback the migration by updating BCM configuration to point back to original hosts.
+    
+    This updates the cmdaemon database to point the slurmaccounting primary back to
+    the original Slurm controller. It does NOT restore the actual Slurm accounting
+    database - that should still be intact on the original hosts.
+    
+    Args:
+        original_primary: Hostname of the original primary Slurm controller (e.g., slurmctl-01)
+        original_backup: Hostname of the original backup Slurm controller (optional)
+    """
+    ensure_root()
+    
+    print("=" * 65)
+    print("ROLLBACK SLURM ACCOUNTING MIGRATION")
+    print("=" * 65)
+    print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
+    # Get current BCM head nodes for reference
+    primary_headnode, secondary_headnode = get_bcm_headnodes()
+    
+    print(f"Current BCM Head Nodes:")
+    print(f"  Primary   : {primary_headnode}")
+    print(f"  Secondary : {secondary_headnode if secondary_headnode else '(none)'}")
+    
+    print(f"\nRollback Target (original Slurm controllers):")
+    print(f"  Primary   : {original_primary}")
+    print(f"  Backup    : {original_backup if original_backup else '(none)'}")
+    
+    # Show current database value
+    verify_sql = "SELECT CAST(extra_values AS CHAR) FROM Roles WHERE CAST(name AS CHAR)='slurmaccounting'"
+    result = subprocess.run(
+        ["mysql", "-N", "cmdaemon", "-e", verify_sql],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        current_value = result.stdout.strip()
+        print(f"\nCurrent slurmaccounting extra_values:")
+        print(f"  {current_value}")
+    
+    print(f"\n⚠ WARNING: This will revert BCM configuration to use the original Slurm controllers.")
+    print("  The Slurm accounting database on those controllers should still be intact.")
+    print("  This does NOT delete the migrated database from the BCM head nodes.")
+    
+    answer = input("\nProceed with rollback? [y/N]: ").strip().lower()
+    if answer not in ("y", "yes"):
+        print("Aborting rollback at user request.")
+        sys.exit(0)
+    
+    # Stop slurmdbd on head nodes first
+    print(f"\n{'=' * 65}")
+    print("STOPPING SLURMDBD SERVICES")
+    print('=' * 65)
+    
+    cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+    try:
+        result = subprocess.run(
+            [cmsh_path, '-c', 'device; foreach -l slurmaccounting (services; stop slurmdbd)'],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0:
+            print("  ✓ Stopped slurmdbd on all slurmaccounting nodes")
+        else:
+            print(f"  ⚠ Could not stop slurmdbd via cmsh: {result.stderr}")
+    except Exception as e:
+        print(f"  ⚠ Error stopping slurmdbd: {e}")
+    
+    time.sleep(2)
+    
+    # Update cmdaemon database
+    print(f"\n{'=' * 65}")
+    print("UPDATING CMDAEMON DATABASE")
+    print('=' * 65)
+    
+    print(f"\nStopping cmdaemon...")
+    result = subprocess.run(
+        ["systemctl", "stop", "cmd"],
+        capture_output=True, text=True, timeout=60
+    )
+    if result.returncode == 0:
+        print(f"  ✓ cmdaemon stopped")
+        time.sleep(2)
+    else:
+        print(f"  ⚠ Warning: Could not stop cmdaemon: {result.stderr}")
+    
+    # Update slurmaccounting primary
+    print(f"\nUpdating slurmaccounting primary to: {original_primary}")
+    update_sql = (
+        f"UPDATE Roles SET extra_values='{{\"ha\":true,\"primary\":\"{original_primary}\"}}' "
+        f"WHERE CAST(name AS CHAR)='slurmaccounting'"
+    )
+    result = subprocess.run(
+        ["mysql", "cmdaemon", "-e", update_sql],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"  ✗ Failed to update primary: {result.stderr}")
+    else:
+        print(f"  ✓ Updated slurmaccounting primary={original_primary}")
+    
+    # Verify
+    result = subprocess.run(
+        ["mysql", "-N", "cmdaemon", "-e", verify_sql],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print(f"  ✓ Verified: {result.stdout.strip()}")
+    
+    # Start cmdaemon
+    print(f"\nStarting cmdaemon...")
+    result = subprocess.run(
+        ["systemctl", "start", "cmd"],
+        capture_output=True, text=True, timeout=60
+    )
+    if result.returncode == 0:
+        print(f"  ✓ cmdaemon started")
+        time.sleep(5)
+    else:
+        print(f"  ⚠ Warning: Could not start cmdaemon: {result.stderr}")
+    
+    # Update storagehost back to the original (not 'master')
+    print(f"\nUpdating slurmaccounting storagehost via cmsh...")
+    try:
+        # Find the overlay name
+        overlay_name = find_slurmaccounting_overlay()
+        
+        role_cmd = (f"configurationoverlay; use {overlay_name}; roles; use slurmaccounting; "
+                    f"set storagehost {original_primary}; commit")
+        result = subprocess.run(
+            [cmsh_path, '-c', role_cmd],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            print(f"  ✓ Updated storagehost={original_primary}")
+        else:
+            print(f"  ⚠ Could not update storagehost: {result.stderr}")
+        
+        # Update overlay nodes back to original controllers
+        nodes_str = original_primary
+        if original_backup:
+            nodes_str = f"{original_primary},{original_backup}"
+        
+        overlay_cmd = (f"configurationoverlay; use {overlay_name}; "
+                       f"set allheadnodes no; set nodes {nodes_str}; commit")
+        result = subprocess.run(
+            [cmsh_path, '-c', overlay_cmd],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            print(f"  ✓ Updated overlay nodes={nodes_str}")
+        else:
+            print(f"  ⚠ Could not update overlay nodes: {result.stderr}")
+            
+    except Exception as e:
+        print(f"  ⚠ Error updating BCM configuration: {e}")
+    
+    # Final summary
+    print(f"\n{'=' * 65}")
+    print("ROLLBACK SUMMARY")
+    print('=' * 65)
+    
+    print(f"\n✓ BCM configuration reverted to use original Slurm controllers:")
+    print(f"    slurmaccounting primary: {original_primary}")
+    print(f"    slurmaccounting storagehost: {original_primary}")
+    
+    print(f"\nNext steps:")
+    print(f"  1) Verify original Slurm controllers are running:")
+    print(f"       ssh {original_primary} 'systemctl status slurmdbd'")
+    print(f"  2) Sync cmdaemon database to passive BCM head node:")
+    print(f"       cmha dbreclone <passive-head-node>")
+    print(f"  3) Test Slurm accounting:")
+    print(f"       sacctmgr show cluster")
+    
+    print(f"\n{'=' * 65}")
+
+
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Migrate Slurm accounting database from Slurm controllers to BCM head nodes.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run full migration
+  %(prog)s
+
+  # Re-update only the slurmaccounting primary field
+  %(prog)s --reupdate-primary
+
+  # Rollback to original Slurm controllers
+  %(prog)s --rollback --original-primary slurmctl-01 --original-backup slurmctl-02
+"""
+    )
+    
+    parser.add_argument(
+        '--reupdate-primary',
+        action='store_true',
+        help='Only re-run the cmdaemon database update for slurmaccounting primary'
+    )
+    
+    parser.add_argument(
+        '--rollback',
+        action='store_true',
+        help='Rollback migration to use original Slurm controllers'
+    )
+    
+    parser.add_argument(
+        '--original-primary',
+        type=str,
+        metavar='HOSTNAME',
+        help='Original primary Slurm controller hostname (required for --rollback)'
+    )
+    
+    parser.add_argument(
+        '--original-backup',
+        type=str,
+        metavar='HOSTNAME',
+        help='Original backup Slurm controller hostname (optional for --rollback)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if args.rollback and not args.original_primary:
+        parser.error("--rollback requires --original-primary")
+    
+    if args.reupdate_primary and args.rollback:
+        parser.error("Cannot use --reupdate-primary and --rollback together")
+    
+    return args
+
+
 def main():
+    args = parse_arguments()
+    
+    # Handle special modes first
+    if args.reupdate_primary:
+        reupdate_primary_only()
+        return
+    
+    if args.rollback:
+        rollback_migration(args.original_primary, args.original_backup)
+        return
+    
+    # Normal migration flow
     ensure_root()
 
     print("=" * 65)
@@ -1377,6 +1865,8 @@ def main():
         "  5) Update slurm.conf with correct accounting host settings:\n"
         f"     - AccountingStorageHost={primary_headnode}\n"
         f"     - AccountingStorageBackupHost={secondary_headnode if secondary_headnode else '(none)'}\n"
+        "  6) Ensure slurmdbd systemd drop-in file on both head nodes\n"
+        "     (clears ConditionPathExists check that would prevent service start)\n"
         "\nAfter migration, the Slurm accounting database will be hosted on the BCM\n"
         "head nodes with HA provided by BCM's MySQL replication (cmha).\n"
     )
@@ -1426,6 +1916,10 @@ def main():
     # BCM's autogenerated section doesn't always set these correctly
     slurm_conf_updated = update_slurm_conf(primary_headnode, secondary_headnode, skip_confirm=False)
     
+    # Step 6: Ensure slurmdbd systemd drop-in file exists on both head nodes
+    # This clears the ConditionPathExists check that would otherwise prevent slurmdbd from starting
+    dropin_ok = ensure_slurmdbd_dropin(primary_headnode, secondary_headnode)
+    
     # Note: We do NOT auto-restart slurmdbd here because cmha dbreclone 
     # needs to run first to sync the database to the passive head node
 
@@ -1459,6 +1953,17 @@ def main():
         print(f"    AccountingStorageHost={primary_headnode}")
         if secondary_headnode:
             print(f"    AccountingStorageBackupHost={secondary_headnode}")
+    
+    if dropin_ok:
+        print(f"\n✓ slurmdbd systemd drop-in file configured on head nodes")
+        print(f"    /etc/systemd/system/slurmdbd.service.d/99-cmd.conf")
+    else:
+        print(f"\n⚠ slurmdbd systemd drop-in file may need manual setup.")
+        print("  Create /etc/systemd/system/slurmdbd.service.d/99-cmd.conf with:")
+        print("    [Unit]")
+        print("    ConditionPathExists=")
+        print("    [Service]")
+        print("    Environment=SLURM_CONF=/cm/shared/apps/slurm/var/etc/slurm/slurm.conf")
     
     print(f"\nNext steps (in order):")
     print("  1) Verify MySQL HA is healthy:")

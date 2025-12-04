@@ -210,36 +210,31 @@ class SlurmHealthcheck:
                     if current_node not in self.accounting_nodes:
                         self.accounting_nodes.append(current_node)
         
-        # Method 2: Try direct role query
+        # Method 2: Try direct role query using foreach -l (most reliable for roles via overlays)
         # Get list of devices with slurmserver role
-        cmd = f'{self.cmsh_path} -c "device; list -l slurmserver"'
+        cmd = f'{self.cmsh_path} -c "device; foreach -l slurmserver (get hostname)"'
         returncode, stdout, _ = self.run_command(['bash', '-c', cmd], timeout=10)
         if returncode == 0:
             for line in stdout.split('\n'):
-                line = line.strip()
-                if line and 'PhysicalNode' in line:
-                    # Format: PhysicalNode  nodename  MAC  category  IP  ...
-                    # Node name is in the second column
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        node = parts[1]
-                        if node and node not in self.controller_nodes:
-                            self.controller_nodes.append(node)
+                node = line.strip()
+                if node and node not in self.controller_nodes:
+                    self.controller_nodes.append(node)
         
         # Get list of devices with slurmaccounting role
-        cmd = f'{self.cmsh_path} -c "device; list -l slurmaccounting"'
+        cmd = f'{self.cmsh_path} -c "device; foreach -l slurmaccounting (get hostname)"'
         returncode, stdout, _ = self.run_command(['bash', '-c', cmd], timeout=10)
         if returncode == 0:
             for line in stdout.split('\n'):
-                line = line.strip()
-                if line and 'PhysicalNode' in line:
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        node = parts[1]
-                        if node and node not in self.accounting_nodes:
-                            self.accounting_nodes.append(node)
+                node = line.strip()
+                if node and node not in self.accounting_nodes:
+                    self.accounting_nodes.append(node)
         
-        # Method 3: If still no nodes found, try to parse from configurationoverlay
+        # Method 3: Check if slurmaccounting overlay uses allheadnodes=yes
+        # If so, discover head nodes via cmha status or cmsh
+        if not self.accounting_nodes:
+            self._discover_accounting_from_allheadnodes()
+        
+        # Method 4: If still no controller nodes found, try to parse from configurationoverlay
         if not self.controller_nodes:
             cmd = f'{self.cmsh_path} -c "configurationoverlay; show"'
             returncode, stdout, _ = self.run_command(['bash', '-c', cmd], timeout=10)
@@ -249,6 +244,82 @@ class SlurmHealthcheck:
                     node = match.group(1)
                     if node not in self.controller_nodes:
                         self.controller_nodes.append(node)
+    
+    def _discover_accounting_from_allheadnodes(self):
+        """Discover accounting nodes when overlay uses allheadnodes=yes.
+        
+        When a configuration overlay with slurmaccounting role has allheadnodes=yes,
+        the role applies to all BCM head nodes. This method finds those head nodes.
+        """
+        if not self.cmsh_path:
+            return
+        
+        # First, check if any overlay with slurmaccounting has allheadnodes=yes
+        # List all overlays to find one with slurmaccounting role
+        cmd = f'{self.cmsh_path} -c "configurationoverlay; list"'
+        returncode, stdout, _ = self.run_command(['bash', '-c', cmd], timeout=10)
+        if returncode != 0:
+            return
+        
+        # Find overlay(s) that have slurmaccounting in their roles
+        overlay_with_accounting = None
+        for line in stdout.split('\n'):
+            if 'slurmaccounting' in line.lower():
+                # First column is the overlay name
+                parts = line.split()
+                if parts:
+                    overlay_with_accounting = parts[0]
+                    break
+        
+        if not overlay_with_accounting:
+            return
+        
+        # Check if this overlay has allheadnodes=yes
+        cmd = f'{self.cmsh_path} -c "configurationoverlay; use {overlay_with_accounting}; get allheadnodes"'
+        returncode, stdout, _ = self.run_command(['bash', '-c', cmd], timeout=10)
+        if returncode != 0:
+            return
+        
+        allheadnodes_value = stdout.strip().lower()
+        if allheadnodes_value not in ('yes', 'true', '1'):
+            return
+        
+        # allheadnodes=yes is set, so discover head nodes
+        # Method A: Use cmha status to find head nodes (most reliable for HA setups)
+        returncode, stdout, _ = self.run_command(['cmha', 'status'], timeout=10)
+        if returncode == 0:
+            # Parse cmha status output
+            # Format: "hostname* -> other_hostname" where * indicates active
+            for line in stdout.split('\n'):
+                if '->' in line:
+                    # Extract hostname (before the ->)
+                    match = re.search(r'(\S+?)\*?\s*->', line)
+                    if match:
+                        hostname = match.group(1)
+                        if hostname and hostname not in self.accounting_nodes:
+                            self.accounting_nodes.append(hostname)
+        
+        # Method B: If cmha didn't give us nodes, try querying head node devices
+        if not self.accounting_nodes:
+            # Query devices of type HeadNode
+            cmd = f'{self.cmsh_path} -c "device; list -t headnode"'
+            returncode, stdout, _ = self.run_command(['bash', '-c', cmd], timeout=10)
+            if returncode == 0:
+                for line in stdout.split('\n'):
+                    line = line.strip()
+                    if line and not line.startswith('Type') and not line.startswith('-'):
+                        # Format: Type  Name  MAC  Category  ...
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            node = parts[1]
+                            if node and node not in self.accounting_nodes:
+                                self.accounting_nodes.append(node)
+        
+        # Method C: Last resort - get local hostname and try to find peer
+        if not self.accounting_nodes:
+            import socket
+            local_hostname = socket.gethostname().split('.')[0]
+            self.accounting_nodes.append(local_hostname)
     
     def run_ssh_command(self, node: str, cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
         """Run a command on a remote node via SSH"""
@@ -937,62 +1008,93 @@ class SlurmHealthcheck:
     def _check_slurmdbd_connections(self, primary_host: str, backup_host: str):
         """Check active connections to slurmdbd to verify primary/backup relationship"""
         # Check connections on primary slurmdbd (port 6819)
+        # Use bash -c to properly handle the piped command
         returncode, stdout, stderr = self.run_ssh_command(
             primary_host,
-            ['ss', '-tnp', '2>/dev/null', '|', 'grep', ':6819', '|', 'grep', 'ESTAB'],
+            ['bash', '-c', 'ss -tnp 2>/dev/null | grep ":6819" | grep ESTAB || true'],
             timeout=10
         )
         
-        # Parse connections
-        slurmctld_connected = False
-        backup_connected = False
+        # Parse connections - look for ESTABLISHED connections on port 6819
+        # ss -tnp shows connections with the local process name (slurmdbd)
+        # We check if there are any established connections to the slurmdbd port
+        has_connections = False
+        connection_count = 0
         
         for line in stdout.split('\n'):
-            if 'slurmctld' in line:
-                slurmctld_connected = True
-            # Check if backup host IP is in the connection (simplified check)
-            # In a proper implementation, we'd resolve hostnames to IPs
+            if 'ESTAB' in line and ':6819' in line:
+                has_connections = True
+                connection_count += 1
         
         # Check connections on backup slurmdbd
         returncode_backup, stdout_backup, stderr_backup = self.run_ssh_command(
             backup_host,
-            ['ss', '-tnp', '2>/dev/null', '|', 'grep', ':6819', '|', 'grep', 'ESTAB'],
+            ['bash', '-c', 'ss -tnp 2>/dev/null | grep ":6819" | grep ESTAB || true'],
             timeout=10
         )
         
-        # Check if backup is connecting TO primary (for state sync)
-        backup_to_primary = 'slurmdbd' in stdout_backup
+        # Check if backup has connections (for state sync or as fallback)
+        backup_has_connections = 'ESTAB' in stdout_backup and ':6819' in stdout_backup
         
         # Report connection status
-        if slurmctld_connected:
+        if has_connections:
             self.add_result(
                 "High Availability", "Accounting Primary Connection",
                 TestStatus.PASS,
-                f"slurmctld connected to primary slurmdbd ({primary_host})",
-                {"primary_host": primary_host, "connections": stdout.count('ESTAB')}
+                f"Active connections to primary slurmdbd ({primary_host})",
+                {"primary_host": primary_host, "connections": connection_count}
             )
         else:
-            self.add_result(
-                "High Availability", "Accounting Primary Connection",
-                TestStatus.WARN,
-                f"Could not verify slurmctld connection to primary ({primary_host})",
-                {"primary_host": primary_host}
+            # If no connections, it might be that slurmctld connects to backup or uses different port
+            # Check if the slurmdbd service is at least listening
+            listen_ret, listen_out, _ = self.run_ssh_command(
+                primary_host,
+                ['bash', '-c', 'ss -tlnp 2>/dev/null | grep ":6819" || true'],
+                timeout=5
             )
+            if ':6819' in listen_out:
+                self.add_result(
+                    "High Availability", "Accounting Primary Connection",
+                    TestStatus.PASS,
+                    f"Primary slurmdbd ({primary_host}) listening on port 6819 (no active connections)",
+                    {"primary_host": primary_host, "listening": True}
+                )
+            else:
+                self.add_result(
+                    "High Availability", "Accounting Primary Connection",
+                    TestStatus.WARN,
+                    f"Could not verify slurmdbd listening on primary ({primary_host})",
+                    {"primary_host": primary_host}
+                )
         
-        if backup_to_primary:
+        if backup_has_connections:
             self.add_result(
                 "High Availability", "Accounting Backup Sync",
                 TestStatus.PASS,
-                f"Backup slurmdbd ({backup_host}) connected to primary for state sync",
+                f"Backup slurmdbd ({backup_host}) has active connections",
                 {"backup_host": backup_host, "primary_host": primary_host}
             )
         else:
-            self.add_result(
-                "High Availability", "Accounting Backup Sync",
-                TestStatus.WARN,
-                f"Could not verify backup ({backup_host}) connection to primary",
-                {"backup_host": backup_host}
+            # Check if backup is at least listening (standby mode)
+            listen_ret, listen_out, _ = self.run_ssh_command(
+                backup_host,
+                ['bash', '-c', 'ss -tlnp 2>/dev/null | grep ":6819" || true'],
+                timeout=5
             )
+            if ':6819' in listen_out:
+                self.add_result(
+                    "High Availability", "Accounting Backup Sync",
+                    TestStatus.PASS,
+                    f"Backup slurmdbd ({backup_host}) listening on port 6819 (standby mode)",
+                    {"backup_host": backup_host, "listening": True}
+                )
+            else:
+                self.add_result(
+                    "High Availability", "Accounting Backup Sync",
+                    TestStatus.WARN,
+                    f"Could not verify backup ({backup_host}) slurmdbd status",
+                    {"backup_host": backup_host}
+                )
     
     def _parse_slurmdbd_conf(self) -> dict:
         """Parse slurmdbd.conf to extract database configuration"""
@@ -1045,15 +1147,22 @@ class SlurmHealthcheck:
         """Check MySQL/MariaDB replication status between accounting nodes
         
         Strategy:
-        1. Try mysql on accounting node via SSH with slurm credentials
-        2. If permission error, try via socket auth (MySQL root, since we run as Linux root)
-        3. If mysql not found on node, fall back to remote connection from BCM head node
+        1. First check if this is a BCM head node setup using cmha (most common for allheadnodes=yes)
+        2. If cmha is available, use it to check MySQL HA status
+        3. Otherwise fall back to traditional MySQL replication checks
         
-        Note: For best results, install mysql-client package on accounting nodes.
+        Note: BCM head nodes use cmha for MySQL HA, not traditional replication.
         """
-        # This checks if database replication is configured and healthy
-        # Note: This assumes standard MySQL/MariaDB replication setup
+        # First, check if this is a BCM cmha setup
+        # cmha is used when accounting runs on BCM head nodes (allheadnodes=yes)
+        returncode, stdout, stderr = self.run_command(['cmha', 'status'], timeout=10)
         
+        if returncode == 0 and 'mysql' in stdout.lower():
+            # This is a BCM cmha setup - check MySQL status via cmha
+            self._check_cmha_mysql_status(stdout)
+            return
+        
+        # Fall back to traditional MySQL replication check
         # Get database credentials from slurmdbd.conf
         db_config = self._parse_slurmdbd_conf()
         
@@ -1223,6 +1332,86 @@ class SlurmHealthcheck:
                     "seconds_behind": seconds_behind_master,
                     "issues": issues
                 }
+            )
+    
+    def _check_cmha_mysql_status(self, cmha_output: str):
+        """Check MySQL HA status using BCM's cmha output.
+        
+        BCM head nodes use cmha for MySQL HA instead of traditional replication.
+        This parses the cmha status output to verify MySQL is healthy on both nodes.
+        
+        Args:
+            cmha_output: Output from 'cmha status' command
+        """
+        # Parse cmha status output
+        # Format:
+        #   hostname* -> peer_hostname
+        #     mysql         [  OK  ]
+        #   peer_hostname -> hostname*
+        #     mysql         [  OK  ]
+        
+        nodes_status = {}
+        current_node = None
+        active_node = None
+        
+        for line in cmha_output.split('\n'):
+            # Check for node line (e.g., "travisw-c1-a* -> travisw-c1-b")
+            if '->' in line:
+                match = re.search(r'(\S+?)(\*)?\s*->\s*(\S+)', line)
+                if match:
+                    node = match.group(1)
+                    is_active = match.group(2) == '*'
+                    current_node = node
+                    nodes_status[node] = {'active': is_active, 'mysql': None}
+                    if is_active:
+                        active_node = node
+            # Check for mysql status line
+            elif current_node and 'mysql' in line.lower():
+                # Look for OK or FAIL status
+                if '[  OK  ]' in line or '[ OK ]' in line or 'OK' in line.upper():
+                    nodes_status[current_node]['mysql'] = 'OK'
+                elif 'FAIL' in line.upper() or 'ERROR' in line.upper():
+                    nodes_status[current_node]['mysql'] = 'FAIL'
+                else:
+                    nodes_status[current_node]['mysql'] = 'UNKNOWN'
+        
+        # Report status for each node
+        all_ok = True
+        for node, status in nodes_status.items():
+            mysql_status = status.get('mysql', 'UNKNOWN')
+            is_active = status.get('active', False)
+            role = "active" if is_active else "standby"
+            
+            if mysql_status == 'OK':
+                self.add_result(
+                    "High Availability", f"DB Replication on {node}",
+                    TestStatus.PASS,
+                    f"MySQL healthy on {node} ({role} node via cmha)",
+                    {"node": node, "role": role, "mysql_status": mysql_status}
+                )
+            elif mysql_status == 'FAIL':
+                all_ok = False
+                self.add_result(
+                    "High Availability", f"DB Replication on {node}",
+                    TestStatus.FAIL,
+                    f"MySQL FAILED on {node} ({role} node via cmha)",
+                    {"node": node, "role": role, "mysql_status": mysql_status}
+                )
+            else:
+                self.add_result(
+                    "High Availability", f"DB Replication on {node}",
+                    TestStatus.WARN,
+                    f"Could not determine MySQL status on {node} ({role} node)",
+                    {"node": node, "role": role, "mysql_status": mysql_status}
+                )
+        
+        # If no nodes were found in cmha output, report that
+        if not nodes_status:
+            self.add_result(
+                "High Availability", "DB Replication (cmha)",
+                TestStatus.SKIP,
+                "Could not parse MySQL status from cmha output",
+                {"cmha_output_preview": cmha_output[:200] if cmha_output else "empty"}
             )
     
     def check_nodes(self) -> Dict[str, Any]:
