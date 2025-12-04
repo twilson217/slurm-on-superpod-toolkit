@@ -39,6 +39,39 @@ from datetime import datetime
 from pathlib import Path
 
 
+def confirm_prompt(prompt: str, default_yes: bool = False) -> bool:
+    """Prompt user for confirmation with robust input handling.
+    
+    Args:
+        prompt: The prompt message (should end with space, e.g., "Proceed? [Y/n]: ")
+        default_yes: If True, empty input (just Enter) is treated as 'yes'
+        
+    Returns:
+        True if user confirmed, False otherwise
+    """
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError:
+        print("No input received (EOF).")
+        return False
+    
+    if not answer:
+        # Empty input - use default
+        if default_yes:
+            return True
+        else:
+            print("Empty input received. (Tip: Type 'y' before pressing Enter)")
+            return False
+    
+    if answer in ('y', 'yes'):
+        return True
+    elif answer in ('n', 'no'):
+        return False
+    else:
+        print(f"Input '{answer}' not recognized.")
+        return default_yes  # Fall back to default on unrecognized input
+
+
 def run_cmd(cmd, check=True, capture_output=False, shell=False):
     """Run a local command."""
     if capture_output:
@@ -371,8 +404,7 @@ def ensure_db_connectivity(cfg) -> bool:
         print(f"  ✓ MySQL client found at: {mysql_path}")
         
         # Ask user for confirmation before modifying remote DB
-        answer = input(f"\n  Update database permissions on {storage_host} to allow connections from this host? [y/N]: ").strip().lower()
-        if answer not in ('y', 'yes'):
+        if not confirm_prompt(f"\n  Update database permissions on {storage_host} to allow connections from this host? [Y/n]: ", default_yes=True):
             print("  Aborting. Please fix database permissions manually.")
             return False
         
@@ -606,8 +638,7 @@ quit
     print(f"    storagehost   : master  (BCM HA virtual hostname)")
     
     if not skip_confirm:
-        answer = input("\nApply these BCM configuration changes? [y/N]: ").strip().lower()
-        if answer not in ('y', 'yes'):
+        if not confirm_prompt("\nApply these BCM configuration changes? [Y/n]: ", default_yes=True):
             print("Skipping BCM configuration update.")
             return False
     
@@ -815,8 +846,7 @@ def update_slurm_conf(primary_headnode: str, secondary_headnode: str, skip_confi
                 print(f"    Line {line_num + 1}: {content}")
             
             if not skip_confirm:
-                answer = input("\nRemove these duplicates? [y/N]: ").strip().lower()
-                if answer not in ('y', 'yes'):
+                if not confirm_prompt("\nRemove these duplicates? [Y/n]: ", default_yes=True):
                     print("Skipping duplicate removal.")
                     return bcm_handles_it
             
