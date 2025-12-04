@@ -1147,22 +1147,149 @@ class SlurmHealthcheck:
         """Check MySQL/MariaDB replication status between accounting nodes
         
         Strategy:
-        1. First check if this is a BCM head node setup using cmha (most common for allheadnodes=yes)
-        2. If cmha is available, use it to check MySQL HA status
-        3. Otherwise fall back to traditional MySQL replication checks
+        1. First determine if accounting nodes ARE the BCM head nodes
+        2. If accounting is on BCM head nodes → use cmha for MySQL HA (database replicated)
+        3. If accounting is on dedicated controllers → check for MySQL replication
+           and verify database files exist on all nodes (critical for failover)
         
         Note: BCM head nodes use cmha for MySQL HA, not traditional replication.
+        Dedicated Slurm controllers typically DON'T have automatic database replication.
         """
-        # First, check if this is a BCM cmha setup
-        # cmha is used when accounting runs on BCM head nodes (allheadnodes=yes)
-        returncode, stdout, stderr = self.run_command(['cmha', 'status'], timeout=10)
+        # Get BCM head nodes from cmha status
+        bcm_head_nodes = []
+        returncode, cmha_stdout, stderr = self.run_command(['cmha', 'status'], timeout=10)
         
-        if returncode == 0 and 'mysql' in stdout.lower():
-            # This is a BCM cmha setup - check MySQL status via cmha
-            self._check_cmha_mysql_status(stdout)
+        if returncode == 0:
+            # Parse cmha status to get head node hostnames
+            for line in cmha_stdout.split('\n'):
+                if '->' in line:
+                    match = re.search(r'(\S+?)\*?\s*->', line)
+                    if match:
+                        bcm_head_nodes.append(match.group(1))
+        
+        # Check if accounting nodes are the BCM head nodes
+        accounting_on_bcm_heads = False
+        if bcm_head_nodes and self.accounting_nodes:
+            # Check if there's overlap between accounting nodes and BCM head nodes
+            accounting_set = set(self.accounting_nodes)
+            bcm_set = set(bcm_head_nodes)
+            if accounting_set & bcm_set:  # Intersection
+                accounting_on_bcm_heads = True
+        
+        if accounting_on_bcm_heads and 'mysql' in cmha_stdout.lower():
+            # Accounting runs on BCM head nodes - use cmha for MySQL HA
+            self._check_cmha_mysql_status(cmha_stdout)
             return
         
-        # Fall back to traditional MySQL replication check
+        # Accounting runs on dedicated controllers (NOT BCM head nodes)
+        # These typically don't have automatic database replication
+        # Check if database files exist on all accounting nodes
+        self._check_dedicated_controller_db_ha()
+        # Note: _check_dedicated_controller_db_ha handles all checks for dedicated controllers
+        return
+    
+    def _check_dedicated_controller_db_ha(self):
+        """Check database HA for dedicated Slurm controllers (not BCM head nodes).
+        
+        Dedicated controllers typically don't have automatic MySQL replication.
+        This checks:
+        1. If database files exist on all accounting nodes
+        2. If MySQL replication is configured (optional but recommended)
+        
+        If the database only exists on one node, this is a FAIL because
+        failover won't work - the backup slurmdbd won't have any data.
+        """
+        if len(self.accounting_nodes) < 2:
+            # Single node setup - no HA to check
+            return
+        
+        # Get database location from slurmdbd.conf
+        db_config = self._parse_slurmdbd_conf()
+        db_name = 'slurm_acct_db'  # Default database name
+        
+        # Try to get actual database name from config or by querying
+        # Common MySQL data directory paths
+        db_paths = [
+            f'/var/lib/mysql/{db_name}',
+            f'/var/lib/mysql/{db_name}/',
+        ]
+        
+        nodes_with_db = []
+        nodes_without_db = []
+        
+        for node in self.accounting_nodes:
+            # Check if database directory exists on this node
+            db_exists = False
+            for db_path in db_paths:
+                # SSH requires the remote command as a single string when using shell features
+                # Use run_command directly with the full ssh command
+                check_cmd = f'test -d "{db_path}" && ls "{db_path}" 2>/dev/null | wc -l'
+                ssh_cmd = ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=5',
+                          node, check_cmd]
+                ret, stdout, stderr = self.run_command(ssh_cmd, timeout=10)
+                if ret == 0 and stdout.strip():
+                    try:
+                        file_count = int(stdout.strip())
+                        if file_count > 0:
+                            db_exists = True
+                            break
+                    except ValueError:
+                        pass
+            
+            if db_exists:
+                nodes_with_db.append(node)
+            else:
+                nodes_without_db.append(node)
+        
+        # Report results
+        if len(nodes_with_db) == len(self.accounting_nodes):
+            # Database exists on all nodes - check if replication is configured
+            self._check_traditional_mysql_replication()
+        elif len(nodes_with_db) == 1:
+            # Database only on one node - this is a problem!
+            self.add_result(
+                "High Availability", "Database Files Distribution",
+                TestStatus.FAIL,
+                f"Database files only exist on {nodes_with_db[0]}. "
+                f"If this node fails, accounting data will be unavailable. "
+                f"Missing on: {', '.join(nodes_without_db)}",
+                {
+                    "nodes_with_db": nodes_with_db,
+                    "nodes_without_db": nodes_without_db,
+                    "ha_status": "NO_REDUNDANCY"
+                }
+            )
+            # Still check replication status on the node that has the DB
+            self._check_traditional_mysql_replication()
+        elif len(nodes_with_db) == 0:
+            # No database found on any node - might be using remote storage
+            self.add_result(
+                "High Availability", "Database Files Distribution",
+                TestStatus.WARN,
+                f"Could not find database files on any accounting node. "
+                f"Database may use shared/remote storage.",
+                {
+                    "nodes_checked": self.accounting_nodes,
+                    "ha_status": "UNKNOWN"
+                }
+            )
+        else:
+            # Database on some but not all nodes
+            self.add_result(
+                "High Availability", "Database Files Distribution",
+                TestStatus.WARN,
+                f"Database files found on {len(nodes_with_db)}/{len(self.accounting_nodes)} nodes. "
+                f"Present on: {', '.join(nodes_with_db)}. Missing on: {', '.join(nodes_without_db)}",
+                {
+                    "nodes_with_db": nodes_with_db,
+                    "nodes_without_db": nodes_without_db,
+                    "ha_status": "PARTIAL"
+                }
+            )
+            self._check_traditional_mysql_replication()
+    
+    def _check_traditional_mysql_replication(self):
+        """Check traditional MySQL/MariaDB replication on dedicated controllers."""
         # Get database credentials from slurmdbd.conf
         db_config = self._parse_slurmdbd_conf()
         

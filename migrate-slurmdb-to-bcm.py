@@ -1694,24 +1694,18 @@ def rollback_migration(original_primary: str, original_backup: str = None):
     else:
         print(f"  ⚠ Warning: Could not start cmdaemon: {result.stderr}")
     
-    # Update storagehost back to the original (not 'master')
-    print(f"\nUpdating slurmaccounting storagehost via cmsh...")
+    # Update BCM configuration via cmsh
+    # Important: Update overlay nodes FIRST, then storagehost
+    # If we try to set storagehost to a node that isn't in the overlay yet,
+    # cmsh may fail or produce warnings
+    print(f"\nUpdating BCM configuration via cmsh...")
     try:
         # Find the overlay name
         overlay_name = find_slurmaccounting_overlay()
         
-        role_cmd = (f"configurationoverlay; use {overlay_name}; roles; use slurmaccounting; "
-                    f"set storagehost {original_primary}; commit")
-        result = subprocess.run(
-            [cmsh_path, '-c', role_cmd],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode == 0:
-            print(f"  ✓ Updated storagehost={original_primary}")
-        else:
-            print(f"  ⚠ Could not update storagehost: {result.stderr}")
-        
-        # Update overlay nodes back to original controllers
+        # Step 1: Update overlay nodes back to original controllers
+        # This must be done BEFORE setting storagehost, otherwise cmsh may
+        # reject the storagehost value since the node isn't in the overlay
         nodes_str = original_primary
         if original_backup:
             nodes_str = f"{original_primary},{original_backup}"
@@ -1726,6 +1720,18 @@ def rollback_migration(original_primary: str, original_backup: str = None):
             print(f"  ✓ Updated overlay nodes={nodes_str}")
         else:
             print(f"  ⚠ Could not update overlay nodes: {result.stderr}")
+        
+        # Step 2: Update storagehost back to the original (not 'master')
+        role_cmd = (f"configurationoverlay; use {overlay_name}; roles; use slurmaccounting; "
+                    f"set storagehost {original_primary}; commit")
+        result = subprocess.run(
+            [cmsh_path, '-c', role_cmd],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            print(f"  ✓ Updated storagehost={original_primary}")
+        else:
+            print(f"  ⚠ Could not update storagehost: {result.stderr}")
             
     except Exception as e:
         print(f"  ⚠ Error updating BCM configuration: {e}")
