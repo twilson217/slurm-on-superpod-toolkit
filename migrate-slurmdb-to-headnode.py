@@ -103,6 +103,56 @@ def ensure_root():
         sys.exit(1)
 
 
+def check_active_headnode() -> bool:
+    """Check if this script is running on the active BCM head node.
+    
+    This is important because the cmdaemon database updates only take effect
+    on the active head node. If running on the passive node, the changes
+    will be overwritten when cmha syncs the database.
+    
+    Returns:
+        True if on active head node (or HA not configured), False otherwise
+    """
+    # Get local hostname
+    result = subprocess.run(["hostname", "-s"], capture_output=True, text=True)
+    local_hostname = result.stdout.strip() if result.returncode == 0 else ""
+    
+    # Check cmha status
+    result = subprocess.run(["cmha", "status"], capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        # cmha not available - likely single head node, OK to proceed
+        return True
+    
+    # Parse output for active node (marked with *)
+    active_node = None
+    for line in result.stdout.split('\n'):
+        if '->' in line and '*' in line:
+            # Format: "hostname* -> ..." - the one with * is active
+            match = re.search(r'(\S+)\*\s*->', line)
+            if match:
+                active_node = match.group(1)
+                break
+    
+    if active_node and active_node != local_hostname:
+        print(f"\n⚠ WARNING: This script is running on {local_hostname}, but the")
+        print(f"  ACTIVE head node is {active_node}.")
+        print(f"\n  The cmdaemon database updates must be made on the active head node.")
+        print(f"  Changes made here may be overwritten when cmha syncs the database.")
+        print(f"\n  Options:")
+        print(f"    1) SSH to {active_node} and run this script there")
+        print(f"    2) Run 'cmha makeactive' on this node first")
+        print(f"    3) Continue anyway (changes may not take effect)")
+        
+        answer = input("\n  Continue anyway? [y/N]: ").strip().lower()
+        if answer not in ('y', 'yes'):
+            print("Aborting. Please run on the active head node.")
+            sys.exit(0)
+        return False
+    
+    return True
+
+
 def find_slurmdbd_conf() -> str:
     """Locate slurmdbd.conf using common BCM/Slurm paths."""
     candidates = [
@@ -1496,6 +1546,7 @@ def reupdate_primary_only():
     initial migration, or if it was overwritten by some other process.
     """
     ensure_root()
+    check_active_headnode()
     
     print("=" * 65)
     print("RE-UPDATE SLURMACCOUNTING PRIMARY")
@@ -1616,6 +1667,7 @@ def rollback_migration(original_primary: str, original_backup: str = None):
         original_backup: Hostname of the original backup Slurm controller (optional)
     """
     ensure_root()
+    check_active_headnode()
     
     print("=" * 65)
     print("ROLLBACK SLURM ACCOUNTING MIGRATION")
@@ -1752,6 +1804,7 @@ def rollback_migration(original_primary: str, original_backup: str = None):
             print(f"  ⚠ Could not update overlay nodes: {result.stderr}")
         
         # Step 2: Update storagehost back to the original (not 'master')
+        # Note: The 'primary' field cannot be set via cmsh - it's in extra_values JSON
         role_cmd = (f"configurationoverlay; use {overlay_name}; roles; use slurmaccounting; "
                     f"set storagehost {original_primary}; commit")
         result = subprocess.run(
@@ -1856,6 +1909,7 @@ def main():
     
     # Normal migration flow
     ensure_root()
+    check_active_headnode()
 
     print("=" * 65)
     print("SLURM ACCOUNTING DATABASE MIGRATION TO BCM HEAD NODES")

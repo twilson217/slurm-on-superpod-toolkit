@@ -140,6 +140,55 @@ def ensure_root():
         sys.exit(1)
 
 
+def check_active_headnode() -> bool:
+    """Check if this script is running on the active BCM head node.
+    
+    This is important because some cmdaemon database updates only take effect
+    on the active head node. If running on the passive node, the changes
+    may be overwritten when cmha syncs the database.
+    
+    Returns:
+        True if on active head node (or HA not configured), False otherwise
+    """
+    # Get local hostname
+    result = subprocess.run(["hostname", "-s"], capture_output=True, text=True)
+    local_hostname = result.stdout.strip() if result.returncode == 0 else ""
+    
+    # Check cmha status
+    result = subprocess.run(["cmha", "status"], capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        # cmha not available - likely single head node, OK to proceed
+        return True
+    
+    # Parse output for active node (marked with *)
+    active_node = None
+    for line in result.stdout.split('\n'):
+        if '->' in line and '*' in line:
+            # Format: "hostname* -> ..." - the one with * is active
+            match = re.search(r'(\S+)\*\s*->', line)
+            if match:
+                active_node = match.group(1)
+                break
+    
+    if active_node and active_node != local_hostname:
+        print(f"\n⚠ WARNING: This script is running on {local_hostname}, but the")
+        print(f"  ACTIVE head node is {active_node}.")
+        print(f"\n  Some configuration changes should be made on the active head node.")
+        print(f"\n  Options:")
+        print(f"    1) SSH to {active_node} and run this script there")
+        print(f"    2) Run 'cmha makeactive' on this node first")
+        print(f"    3) Continue anyway (some changes may not take effect)")
+        
+        answer = input("\n  Continue anyway? [y/N]: ").strip().lower()
+        if answer not in ('y', 'yes'):
+            print("Aborting. Please run on the active head node.")
+            sys.exit(0)
+        return False
+    
+    return True
+
+
 def run_cmsh(cmsh_commands: str, check: bool = True) -> subprocess.CompletedProcess:
     """Run cmsh commands and return the result.
     
@@ -937,6 +986,7 @@ def main():
     args = parse_arguments()
     
     ensure_root()
+    check_active_headnode()
     
     print("=" * 65)
     print("SLURM CONTROLLER MIGRATION TO BCM HEAD NODES")
