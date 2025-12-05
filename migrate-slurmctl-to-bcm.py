@@ -40,6 +40,42 @@ from datetime import datetime
 SLURM_TAKEOVER_SCRIPT = '/cm/local/apps/cmd/scripts/slurm.takeover.sh'
 
 
+def get_bcm_major_version() -> int:
+    """Get the BCM major version number.
+    
+    Runs: cmsh -c "main; versioninfo" and parses the Cluster Manager version.
+    
+    Returns:
+        Major version number (e.g., 10 or 11), or 10 as default if detection fails
+    """
+    cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+    
+    try:
+        result = subprocess.run(
+            [cmsh_path, '-c', 'main; versioninfo'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if 'cluster manager' in line.lower():
+                    # Format: "Cluster Manager          10.0" or "Cluster Manager          11.0"
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        version_str = parts[-1]  # e.g., "10.0" or "11.0"
+                        major_version = int(version_str.split('.')[0])
+                        return major_version
+        
+        # Default to BCM 10 if detection fails
+        return 10
+        
+    except Exception:
+        # Default to BCM 10 if detection fails
+        return 10
+
+
 def confirm_prompt(prompt: str, default_yes: bool = False) -> bool:
     """Prompt user for confirmation with robust input handling.
     
@@ -497,15 +533,23 @@ def get_current_prefailover_script() -> str:
         return ""
 
 
-def configure_scontrol_takeover(enable: bool, skip_confirm: bool = False) -> bool:
+def configure_scontrol_takeover(enable: bool, wlm_cluster: str = "slurm", 
+                                 overlay_name: str = "slurm-server", skip_confirm: bool = False) -> bool:
     """Configure or remove scontrol takeover on BCM failover.
     
-    When enabled, this sets the preFailoverScript on the base partition
-    to the slurm.takeover.sh script, which runs 'scontrol takeover' when
-    BCM fails over to the secondary head node.
+    When enabled, this does TWO things:
+    1. Sets the preFailoverScript on the base partition to slurm.takeover.sh
+    2. Enables takeover mode to prevent BCM from auto-restarting slurmctld:
+       - BCM 10.x: wlm; set --extra takeover yes
+       - BCM 11.x: configurationoverlay; roles; set slurmctldstartpolicy TAKEOVER
+    
+    The takeover mode setting prevents BCM from auto-restarting slurmctld
+    when it stops due to a takeover, which would cause the takeover to fail.
     
     Args:
         enable: True to enable, False to disable
+        wlm_cluster: Name of the WLM cluster (default: "slurm")
+        overlay_name: Name of the slurm-server overlay (default: "slurm-server")
         skip_confirm: If True, don't prompt for confirmation
         
     Returns:
@@ -515,15 +559,20 @@ def configure_scontrol_takeover(enable: bool, skip_confirm: bool = False) -> boo
     print("CONFIGURING SCONTROL TAKEOVER ON BCM FAILOVER")
     print('=' * 65)
     
-    # Check current setting
+    cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+    
+    # Detect BCM version
+    bcm_version = get_bcm_major_version()
+    print(f"\nDetected BCM version: {bcm_version}.x")
+    
+    # Check current settings
     current_script = get_current_prefailover_script()
     
-    print(f"\nCurrent preFailoverScript: {current_script if current_script else '(not set)'}")
+    print(f"\nCurrent settings:")
+    print(f"  preFailoverScript: {current_script if current_script else '(not set)'}")
     
     if enable:
-        if current_script == SLURM_TAKEOVER_SCRIPT:
-            print(f"  ✓ Already configured for scontrol takeover")
-            return True
+        already_configured = current_script == SLURM_TAKEOVER_SCRIPT
         
         if current_script and current_script != SLURM_TAKEOVER_SCRIPT:
             print(f"\n  ⚠ WARNING: A different preFailoverScript is already set:")
@@ -538,17 +587,52 @@ def configure_scontrol_takeover(enable: bool, skip_confirm: bool = False) -> boo
                     print("  Skipping scontrol takeover configuration.")
                     return False
         
-        print(f"\nPlanned change:")
-        print(f"  partition[base]->failover->preFailoverScript = {SLURM_TAKEOVER_SCRIPT}")
+        print(f"\nPlanned changes:")
+        print(f"  1. partition[base]->failover->preFailoverScript = {SLURM_TAKEOVER_SCRIPT}")
+        if bcm_version >= 11:
+            print(f"  2. configurationoverlay[{overlay_name}]->roles[slurmserver]->slurmctldstartpolicy = TAKEOVER")
+        else:
+            print(f"  2. wlm[{wlm_cluster}] --extra takeover = yes")
+        print(f"\n  NOTE: The takeover mode setting is required for scontrol takeover")
+        print(f"        to work. It prevents BCM from auto-restarting slurmctld after takeover.")
         
         if not skip_confirm:
-            if not confirm_prompt("\nApply this configuration? [Y/n]: ", default_yes=True):
+            if not confirm_prompt("\nApply these configurations? [Y/n]: ", default_yes=True):
                 print("Skipping scontrol takeover configuration.")
                 return False
         
-        # Apply the configuration
-        cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
-        cmd = f"partition; use base; failover; set prefailoverscript {SLURM_TAKEOVER_SCRIPT}; commit"
+        success = True
+        
+        # Apply preFailoverScript
+        if not already_configured:
+            cmd = f"partition; use base; failover; set prefailoverscript {SLURM_TAKEOVER_SCRIPT}; commit"
+            try:
+                result = subprocess.run(
+                    [cmsh_path, '-c', cmd],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                if result.returncode != 0:
+                    print(f"  ✗ Failed to set preFailoverScript: {result.stderr}")
+                    success = False
+                else:
+                    print(f"  ✓ Set preFailoverScript to {SLURM_TAKEOVER_SCRIPT}")
+            except Exception as e:
+                print(f"  ✗ Error setting preFailoverScript: {e}")
+                success = False
+        else:
+            print(f"  ✓ preFailoverScript already configured")
+        
+        # Apply takeover mode setting based on BCM version
+        if bcm_version >= 11:
+            # BCM 11.x: Use slurmctldstartpolicy TAKEOVER on the slurmserver role
+            cmd = f"configurationoverlay; use {overlay_name}; roles; use slurmserver; set slurmctldstartpolicy TAKEOVER; commit"
+            setting_desc = f"slurmctldstartpolicy = TAKEOVER"
+        else:
+            # BCM 10.x: Use --extra takeover yes on WLM cluster
+            cmd = f"wlm; use {wlm_cluster}; set --extra takeover yes; commit"
+            setting_desc = f"wlm[{wlm_cluster}] --extra takeover = yes"
         
         try:
             result = subprocess.run(
@@ -557,41 +641,68 @@ def configure_scontrol_takeover(enable: bool, skip_confirm: bool = False) -> boo
                 text=True,
                 timeout=30
             )
-            
             if result.returncode != 0:
-                print(f"  ✗ Failed to set preFailoverScript: {result.stderr}")
-                return False
-            
-            print(f"  ✓ Set preFailoverScript to {SLURM_TAKEOVER_SCRIPT}")
-            return True
-            
+                print(f"  ✗ Failed to set takeover mode: {result.stderr}")
+                success = False
+            else:
+                print(f"  ✓ Set {setting_desc}")
         except Exception as e:
-            print(f"  ✗ Error configuring takeover: {e}")
-            return False
+            print(f"  ✗ Error setting takeover mode: {e}")
+            success = False
+        
+        return success
     
     else:
         # Disable takeover
         if not current_script:
             print(f"  ✓ preFailoverScript is already not set")
-            return True
-        
-        if current_script != SLURM_TAKEOVER_SCRIPT:
+        elif current_script != SLURM_TAKEOVER_SCRIPT:
             print(f"\n  ⚠ Current preFailoverScript is not the Slurm takeover script:")
             print(f"    Current: {current_script}")
-            print(f"  Not modifying this setting.")
-            return False
+            print(f"  Not modifying preFailoverScript.")
         
-        print(f"\nPlanned change:")
-        print(f"  partition[base]->failover->preFailoverScript = (cleared)")
+        print(f"\nPlanned changes:")
+        print(f"  1. partition[base]->failover->preFailoverScript = (cleared)")
+        if bcm_version >= 11:
+            print(f"  2. configurationoverlay[{overlay_name}]->roles[slurmserver]->slurmctldstartpolicy = ALWAYS")
+        else:
+            print(f"  2. wlm[{wlm_cluster}] --extra takeover = (cleared)")
         
         if not skip_confirm:
-            if not confirm_prompt("\nApply this configuration? [Y/n]: ", default_yes=True):
+            if not confirm_prompt("\nApply these configurations? [Y/n]: ", default_yes=True):
                 print("Skipping scontrol takeover removal.")
                 return False
         
-        # Clear the configuration
-        cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
-        cmd = "partition; use base; failover; set prefailoverscript; commit"
+        success = True
+        
+        # Clear preFailoverScript
+        if current_script == SLURM_TAKEOVER_SCRIPT:
+            cmd = "partition; use base; failover; set prefailoverscript; commit"
+            try:
+                result = subprocess.run(
+                    [cmsh_path, '-c', cmd],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                if result.returncode != 0:
+                    print(f"  ✗ Failed to clear preFailoverScript: {result.stderr}")
+                    success = False
+                else:
+                    print(f"  ✓ Cleared preFailoverScript")
+            except Exception as e:
+                print(f"  ✗ Error clearing preFailoverScript: {e}")
+                success = False
+        
+        # Clear takeover mode setting based on BCM version
+        if bcm_version >= 11:
+            # BCM 11.x: Set slurmctldstartpolicy to ALWAYS
+            cmd = f"configurationoverlay; use {overlay_name}; roles; use slurmserver; set slurmctldstartpolicy ALWAYS; commit"
+            setting_desc = "slurmctldstartpolicy = ALWAYS"
+        else:
+            # BCM 10.x: Clear --extra takeover on WLM cluster
+            cmd = f"wlm; use {wlm_cluster}; set --extra takeover no; commit"
+            setting_desc = f"wlm[{wlm_cluster}] --extra takeover"
         
         try:
             result = subprocess.run(
@@ -600,17 +711,15 @@ def configure_scontrol_takeover(enable: bool, skip_confirm: bool = False) -> boo
                 text=True,
                 timeout=30
             )
-            
             if result.returncode != 0:
-                print(f"  ✗ Failed to clear preFailoverScript: {result.stderr}")
-                return False
-            
-            print(f"  ✓ Cleared preFailoverScript")
-            return True
-            
+                print(f"  ⚠ Could not clear takeover mode: {result.stderr}")
+                # Don't fail on this - the setting might not exist
+            else:
+                print(f"  ✓ Cleared {setting_desc}")
         except Exception as e:
-            print(f"  ✗ Error removing takeover configuration: {e}")
-            return False
+            print(f"  ⚠ Could not clear takeover mode: {e}")
+        
+        return success
 
 
 def update_slurmserver_overlay(skip_confirm: bool = False) -> tuple:
@@ -837,8 +946,10 @@ def main():
     # Get BCM head node information
     primary_headnode, secondary_headnode = get_bcm_headnodes()
     ha_available = check_ha_available()
+    bcm_version = get_bcm_major_version()
     
-    print(f"BCM Head Node Information:")
+    print(f"BCM Information:")
+    print(f"  BCM version          : {bcm_version}.x")
     print(f"  Primary head node    : {primary_headnode}")
     print(f"  Secondary head node  : {secondary_headnode if secondary_headnode else '(none)'}")
     print(f"  HA available         : {'yes' if ha_available else 'no'}")
@@ -848,14 +959,24 @@ def main():
         if not ha_available:
             print("\n  ✗ Error: BCM HA is not available. Cannot configure scontrol takeover.")
             sys.exit(1)
-        configure_scontrol_takeover(enable=True, skip_confirm=True)
+        try:
+            wlm_cluster = find_slurm_wlm_cluster()
+        except RuntimeError as e:
+            print(f"\n  ✗ {e}")
+            sys.exit(1)
+        configure_scontrol_takeover(enable=True, wlm_cluster=wlm_cluster, skip_confirm=True)
         print(f"\n{'=' * 65}")
         print("CONFIGURATION COMPLETE")
         print('=' * 65)
         sys.exit(0)
     
     if args.disable_takeover_only:
-        configure_scontrol_takeover(enable=False, skip_confirm=True)
+        try:
+            wlm_cluster = find_slurm_wlm_cluster()
+        except RuntimeError as e:
+            print(f"\n  ✗ {e}")
+            sys.exit(1)
+        configure_scontrol_takeover(enable=False, wlm_cluster=wlm_cluster, skip_confirm=True)
         print(f"\n{'=' * 65}")
         print("CONFIGURATION COMPLETE")
         print('=' * 65)
@@ -893,7 +1014,8 @@ def main():
             current_script = get_current_prefailover_script()
             if current_script == SLURM_TAKEOVER_SCRIPT:
                 print("\n  Also removing scontrol takeover configuration...")
-                configure_scontrol_takeover(enable=False, skip_confirm=True)
+                configure_scontrol_takeover(enable=False, wlm_cluster=wlm_cluster, 
+                                           overlay_name=overlay_name, skip_confirm=True)
         
         # Restart services
         if success:
@@ -965,9 +1087,11 @@ def main():
     
     if ha_available:
         if args.enable_takeover:
-            takeover_configured = configure_scontrol_takeover(enable=True, skip_confirm=True)
+            takeover_configured = configure_scontrol_takeover(
+                enable=True, wlm_cluster=wlm_cluster, overlay_name=overlay_name, skip_confirm=True)
         elif args.disable_takeover:
-            configure_scontrol_takeover(enable=False, skip_confirm=True)
+            configure_scontrol_takeover(
+                enable=False, wlm_cluster=wlm_cluster, overlay_name=overlay_name, skip_confirm=True)
         else:
             # Prompt user
             print(f"\n{'=' * 65}")
@@ -977,11 +1101,13 @@ def main():
             print(f"\nBCM HA is available. When the BCM head nodes failover, you can")
             print(f"optionally have Slurm automatically run 'scontrol takeover' to move")
             print(f"the primary slurmctld to the new active head node.")
-            print(f"\nThis is done by setting the preFailoverScript on partition[base]->failover")
-            print(f"to: {SLURM_TAKEOVER_SCRIPT}")
+            print(f"\nThis requires TWO settings (BCM version will be auto-detected):")
+            print(f"  1. preFailoverScript = {SLURM_TAKEOVER_SCRIPT}")
+            print(f"  2. Takeover mode (BCM 10: --extra takeover; BCM 11: slurmctldstartpolicy)")
             
             if confirm_prompt("\nWould you like to enable automatic scontrol takeover on BCM failover? [Y/n]: ", default_yes=True):
-                takeover_configured = configure_scontrol_takeover(enable=True, skip_confirm=True)
+                takeover_configured = configure_scontrol_takeover(
+                    enable=True, wlm_cluster=wlm_cluster, overlay_name=overlay_name, skip_confirm=True)
             else:
                 print("Skipping scontrol takeover configuration.")
     

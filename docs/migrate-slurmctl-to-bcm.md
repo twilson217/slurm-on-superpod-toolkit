@@ -128,23 +128,57 @@ cmsh -c "wlm; use slurm; clear primaryserver; commit"
 
 ## Step 4: (Optional) Configure Automatic Scontrol Takeover
 
-When BCM HA fails over from one head node to another, Slurm can automatically run `scontrol takeover` to move the primary slurmctld to the new active head node. This is done by setting a preFailoverScript on the BCM partition.
+When BCM HA fails over from one head node to another, Slurm can automatically run `scontrol takeover` to move the primary slurmctld to the new active head node. 
 
-### Check current preFailoverScript setting
+**This requires TWO settings:**
+1. `preFailoverScript` - tells BCM to run the takeover script during failover
+2. A "takeover mode" setting that prevents BCM from auto-restarting slurmctld after takeover
 
+> **Important:** Without the takeover mode setting, BCM will automatically restart slurmctld after it stops, causing the takeover to fail or behave unexpectedly.
+
+### BCM Version Differences
+
+The takeover mode setting differs between BCM versions:
+
+| BCM Version | Takeover Mode Setting |
+|-------------|----------------------|
+| **BCM 10.x** | `cmsh -c "wlm; use slurm; set --extra takeover yes; commit"` |
+| **BCM 11.x** | `cmsh -c "configurationoverlay; use slurm-server; roles; use slurmserver; set slurmctldstartpolicy TAKEOVER; commit"` |
+
+To check your BCM version:
 ```bash
-cmsh -c "partition; use base; failover; get prefailoverscript"
+cmsh -c "main; versioninfo" | grep -i "cluster manager"
 ```
 
-If the output is empty or shows a different script, you can configure the takeover script.
+### Check current settings
+
+```bash
+# Check preFailoverScript
+cmsh -c "partition; use base; failover; get prefailoverscript"
+
+# Check takeover mode (BCM 10.x)
+cmsh -c "wlm; use slurm; show" | grep -i extra
+
+# Check takeover mode (BCM 11.x)
+cmsh -c "configurationoverlay; use slurm-server; roles; use slurmserver; get slurmctldstartpolicy"
+```
 
 ### Enable automatic scontrol takeover
 
+**Both settings are required:**
+
 ```bash
+# 1. Set the preFailoverScript (same for BCM 10 and 11)
 cmsh -c "partition; use base; failover; set prefailoverscript /cm/local/apps/cmd/scripts/slurm.takeover.sh; commit"
+
+# 2. Enable takeover mode (BCM 10.x)
+cmsh -c "wlm; use slurm; set --extra takeover yes; commit"
+
+# 2. Enable takeover mode (BCM 11.x) - use this instead for BCM 11
+# cmsh -c "configurationoverlay; use slurm-server; roles; use slurmserver; set slurmctldstartpolicy TAKEOVER; commit"
 ```
 
-### Verify the setting
+### Verify the settings
 
 ```bash
 cmsh -c "partition; use base; failover; get prefailoverscript"
@@ -245,10 +279,17 @@ srun hostname
 If you need to disable the automatic scontrol takeover:
 
 ```bash
+# Clear the preFailoverScript
 cmsh -c "partition; use base; failover; set prefailoverscript; commit"
+
+# Disable takeover mode (BCM 10.x)
+cmsh -c "wlm; use slurm; set --extra takeover no; commit"
+
+# Disable takeover mode (BCM 11.x) - use this instead for BCM 11
+# cmsh -c "configurationoverlay; use slurm-server; roles; use slurmserver; set slurmctldstartpolicy ALWAYS; commit"
 ```
 
-This clears the preFailoverScript setting.
+This clears both settings required for automatic takeover.
 
 ---
 
@@ -312,22 +353,44 @@ Common issues:
 
 ### Scontrol Takeover Not Working During Failover
 
-1. Verify the preFailoverScript is set:
+1. **Verify the takeover mode setting is enabled** (most common issue):
+
+   For BCM 10.x:
+   ```bash
+   cmsh -c "wlm; use slurm; show" | grep -i extra
+   ```
+   If not set, enable it:
+   ```bash
+   cmsh -c "wlm; use slurm; set --extra takeover yes; commit"
+   ```
+
+   For BCM 11.x:
+   ```bash
+   cmsh -c "configurationoverlay; use slurm-server; roles; use slurmserver; get slurmctldstartpolicy"
+   ```
+   If not set to TAKEOVER, enable it:
+   ```bash
+   cmsh -c "configurationoverlay; use slurm-server; roles; use slurmserver; set slurmctldstartpolicy TAKEOVER; commit"
+   ```
+
+   > **Important:** Without this setting, BCM auto-restarts slurmctld after takeover, causing it to fail.
+
+2. Verify the preFailoverScript is set:
    ```bash
    cmsh -c "partition; use base; failover; get prefailoverscript"
    ```
 
-2. Check if the takeover script exists:
+3. Check if the takeover script exists:
    ```bash
    ls -la /cm/local/apps/cmd/scripts/slurm.takeover.sh
    ```
 
-3. Check the takeover log after a failover:
+4. Check the takeover log after a failover:
    ```bash
    cat /var/log/slurmtakeover.sh.log
    ```
 
-4. Enable debug mode in the takeover script by running:
+5. Enable debug mode in the takeover script by running:
    ```bash
    /cm/local/apps/cmd/sbin/cmdaemonctl set full-status
    ```
@@ -365,6 +428,7 @@ scontrol takeover
 
 | Action | Command |
 |--------|---------|
+| Check BCM version | `cmsh -c "main; versioninfo" \| grep "Cluster Manager"` |
 | List overlays | `cmsh -c "configurationoverlay; list"` |
 | Show overlay details | `cmsh -c "configurationoverlay; use OVERLAY; show"` |
 | Set all head nodes | `cmsh -c "configurationoverlay; use OVERLAY; set allheadnodes yes; commit"` |
@@ -372,6 +436,10 @@ scontrol takeover
 | Get WLM primaryserver | `cmsh -c "wlm; use slurm; get primaryserver"` |
 | Set WLM primaryserver | `cmsh -c "wlm; use slurm; set primaryserver HOSTNAME; commit"` |
 | Clear WLM primaryserver | `cmsh -c "wlm; use slurm; clear primaryserver; commit"` |
+| Enable takeover (BCM 10) | `cmsh -c "wlm; use slurm; set --extra takeover yes; commit"` |
+| Disable takeover (BCM 10) | `cmsh -c "wlm; use slurm; set --extra takeover no; commit"` |
+| Enable takeover (BCM 11) | `cmsh -c "configurationoverlay; use slurm-server; roles; use slurmserver; set slurmctldstartpolicy TAKEOVER; commit"` |
+| Disable takeover (BCM 11) | `cmsh -c "configurationoverlay; use slurm-server; roles; use slurmserver; set slurmctldstartpolicy ALWAYS; commit"` |
 | Set preFailoverScript | `cmsh -c "partition; use base; failover; set prefailoverscript PATH; commit"` |
 | Clear preFailoverScript | `cmsh -c "partition; use base; failover; set prefailoverscript; commit"` |
 | Restart slurmctld | `cmsh -c "device; foreach -l slurmserver (services; restart slurmctld)"` |

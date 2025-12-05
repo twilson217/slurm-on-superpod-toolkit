@@ -2,6 +2,8 @@
 
 Tools for managing Slurm upgrades, healthchecks, backups, and migrations in BCM-managed DGX SuperPOD clusters.
 
+> **Note:** This toolkit was developed and tested against **BCM 10.x**. Some commands differ in BCM 11.x (e.g., the takeover mode setting). The scripts attempt to detect the BCM version and use the appropriate commands, but please verify compatibility if running on BCM 11.x.
+
 ## Scripts
 
 ### `healthcheck-slurm.py`
@@ -65,7 +67,32 @@ Migrate Slurm accounting database from dedicated controllers to BCM head nodes. 
 - `--reupdate-primary` — Re-run only the cmdaemon database update for the slurmaccounting primary. Useful if the primary field wasn't properly updated during initial migration.
 - `--rollback` — Revert BCM configuration to use original Slurm controllers. Requires `--original-primary` and optionally `--original-backup`.
 
-**Manual procedure:** See `plans/migrate-slurmdb-to-bcm.md` for step-by-step manual instructions.
+**Manual procedure:** See `docs/migrate-slurmdb-to-bcm.md` for step-by-step manual instructions.
+
+---
+
+### `migrate-slurmctl-to-bcm.py`
+
+Migrate Slurm controller (slurmctld) from dedicated nodes to BCM head nodes. Configures automatic failover integration.
+
+```bash
+./migrate-slurmctl-to-bcm.py                    # Full migration (interactive)
+./migrate-slurmctl-to-bcm.py --enable-takeover  # Enable scontrol takeover (no prompts)
+./migrate-slurmctl-to-bcm.py --enable-takeover-only  # Only configure takeover
+./migrate-slurmctl-to-bcm.py --rollback \       # Rollback to original controllers
+    --original-nodes slurmctl-01,slurmctl-02
+```
+
+**What it does:**
+1. Updates slurm-server overlay to use `allheadnodes yes`
+2. Clears specific node assignments
+3. Updates WLM `primaryserver` to active head node
+4. (Optional) Configures automatic `scontrol takeover` on BCM failover:
+   - Sets `preFailoverScript` to slurm.takeover.sh
+   - Enables takeover mode (BCM 10: `--extra takeover`; BCM 11: `slurmctldstartpolicy TAKEOVER`)
+5. Restarts slurmctld services
+
+**Manual procedure:** See `docs/migrate-slurmctl-to-bcm.md` for step-by-step manual instructions.
 
 ---
 
@@ -98,12 +125,13 @@ Comprehensive backup of Slurm-related files from BCM clusters. Includes systemd 
 ├── backup-slurm-db.py          # DB backup/restore
 ├── backup-slurm-files.py       # Slurm files backup/restore
 ├── migrate-slurmdb-to-bcm.py   # DB migration to BCM heads
+├── migrate-slurmctl-to-bcm.py  # Slurm controller migration to BCM heads
 ├── healthcheck-config.conf     # Healthcheck configuration
-├── plans/                      # Upgrade, migration, and healthcheck plans
+├── docs/                       # Upgrade plans and manual procedures
 │   ├── slurm-upgrade-23.11-to-25.05-plan.md
-│   ├── slurm-healthcheck-plan.md
-│   └── migrate-slurmdb-to-bcm.md  # Manual migration procedure
-└── .docs/                      # Reference documentation
+│   ├── migrate-slurmdb-to-bcm.md   # Manual DB migration procedure
+│   └── migrate-slurmctl-to-bcm.md  # Manual controller migration procedure
+└── .docs/                      # Reference documentation (BCM admin manual)
 ```
 
 ## Requirements
