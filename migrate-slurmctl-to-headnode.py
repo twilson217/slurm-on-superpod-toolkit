@@ -4,11 +4,14 @@ Migrate Slurm controller (slurmctld) from dedicated nodes to BCM head nodes.
 
 This script is intended to be run on the ACTIVE BCM head node as root.
 It will:
-  1. Find the configuration overlay with the slurm-server (slurmserver) role
-  2. Update the overlay to run on all BCM head nodes instead of specific nodes:
+  1. Check for PrologSlurmctld/EpilogSlurmctld scripts:
+     - If set and NOT on /cm/shared, copy them to BCM head nodes
+     - If on /cm/shared (shared storage), no action needed
+  2. Find the configuration overlay with the slurm-server (slurmserver) role
+  3. Update the overlay to run on all BCM head nodes instead of specific nodes:
      - Set 'allheadnodes yes'
      - Clear the 'nodes' setting
-  3. Optionally configure automatic 'scontrol takeover' on BCM failover:
+  4. Optionally configure automatic 'scontrol takeover' on BCM failover:
      - Set partition[base]->failover->preFailoverScript to the takeover script
      - This ensures slurmctld moves to the active BCM head node during HA failover
 
@@ -771,6 +774,217 @@ def configure_scontrol_takeover(enable: bool, wlm_cluster: str = "slurm",
         return success
 
 
+def get_slurmctld_prolog_epilog(wlm_cluster: str) -> dict:
+    """Get the PrologSlurmctld and EpilogSlurmctld settings from WLM.
+    
+    Args:
+        wlm_cluster: Name of the WLM cluster
+        
+    Returns:
+        Dictionary with 'prolog' and 'epilog' keys, values are paths or empty strings
+    """
+    cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+    result = {'prolog': '', 'epilog': ''}
+    
+    for setting, key in [('prologslurmctld', 'prolog'), ('epilogslurmctld', 'epilog')]:
+        try:
+            cmd_result = subprocess.run(
+                [cmsh_path, '-c', f'wlm; use {wlm_cluster}; get {setting}'],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            # Parse output - look for a path (starts with /)
+            for line in cmd_result.stdout.split('\n'):
+                line = line.strip()
+                if line and line.startswith('/'):
+                    result[key] = line
+                    break
+                    
+        except Exception:
+            pass
+    
+    return result
+
+
+def copy_slurmctld_scripts_to_headnodes(wlm_cluster: str, primary_headnode: str, 
+                                         secondary_headnode: str, skip_confirm: bool = False) -> bool:
+    """Check and copy PrologSlurmctld/EpilogSlurmctld scripts to BCM head nodes.
+    
+    If these scripts are configured and NOT on /cm/shared (shared storage),
+    they need to be copied to the BCM head nodes for slurmctld to work.
+    
+    Args:
+        wlm_cluster: Name of the WLM cluster
+        primary_headnode: Primary BCM head node hostname
+        secondary_headnode: Secondary BCM head node hostname (can be None)
+        skip_confirm: If True, don't prompt for confirmation
+        
+    Returns:
+        True if no issues or scripts were copied successfully
+    """
+    print(f"\n{'=' * 65}")
+    print("CHECKING SLURMCTLD PROLOG/EPILOG SCRIPTS")
+    print('=' * 65)
+    
+    scripts = get_slurmctld_prolog_epilog(wlm_cluster)
+    
+    print(f"\nCurrent WLM settings:")
+    print(f"  PrologSlurmctld: {scripts['prolog'] if scripts['prolog'] else '(not set)'}")
+    print(f"  EpilogSlurmctld: {scripts['epilog'] if scripts['epilog'] else '(not set)'}")
+    
+    # Check which scripts need to be copied
+    scripts_to_copy = []
+    
+    for script_type, script_path in [('PrologSlurmctld', scripts['prolog']), 
+                                      ('EpilogSlurmctld', scripts['epilog'])]:
+        if not script_path:
+            continue
+        
+        if script_path.startswith('/cm/shared'):
+            print(f"\n  ✓ {script_type} is on shared storage: {script_path}")
+            continue
+        
+        # Script is NOT on shared storage - needs to be copied
+        scripts_to_copy.append((script_type, script_path))
+        print(f"\n  ⚠ {script_type} is NOT on shared storage: {script_path}")
+        print(f"    This script needs to be present on the BCM head nodes")
+    
+    if not scripts_to_copy:
+        print(f"\n  ✓ No scripts need to be copied")
+        return True
+    
+    # Determine target nodes
+    target_nodes = [primary_headnode]
+    if secondary_headnode:
+        target_nodes.append(secondary_headnode)
+    
+    print(f"\nScripts to copy to BCM head nodes ({', '.join(target_nodes)}):")
+    for script_type, script_path in scripts_to_copy:
+        print(f"  - {script_path} ({script_type})")
+    
+    if not skip_confirm:
+        if not confirm_prompt("\nCopy these scripts to the BCM head nodes? [Y/n]: ", default_yes=True):
+            print("Skipping script copy. You will need to copy them manually.")
+            print("\n  Manual copy commands:")
+            for script_type, script_path in scripts_to_copy:
+                for node in target_nodes:
+                    print(f"    scp <source_node>:{script_path} {node}:{script_path}")
+            return False
+    
+    # Copy the scripts
+    success = True
+    
+    for script_type, script_path in scripts_to_copy:
+        # First, find where the script currently exists
+        # Try to get it from the current slurmctld nodes
+        source_node = None
+        
+        # Check if it exists on any of the current slurmserver nodes
+        cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+        result = subprocess.run(
+            [cmsh_path, '-c', 'device; foreach -l slurmserver (get hostname)'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        current_slurmctl_nodes = [line.strip() for line in result.stdout.split('\n') if line.strip()]
+        
+        # Find a source node that has the script
+        for node in current_slurmctl_nodes:
+            if node in target_nodes:
+                continue  # Skip if it's already a head node
+            
+            # Check if script exists on this node
+            check_cmd = f'test -f "{script_path}" && echo exists'
+            ssh_result = subprocess.run(
+                ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=5',
+                 node, check_cmd],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            if ssh_result.returncode == 0 and 'exists' in ssh_result.stdout:
+                source_node = node
+                break
+        
+        if not source_node:
+            print(f"\n  ⚠ Could not find source for {script_type}: {script_path}")
+            print(f"    Please copy this script manually to the head nodes")
+            success = False
+            continue
+        
+        print(f"\n  Copying {script_type} from {source_node}...")
+        
+        # Copy to each target node
+        for target_node in target_nodes:
+            # Create target directory if needed
+            target_dir = os.path.dirname(script_path)
+            mkdir_result = subprocess.run(
+                ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=5',
+                 target_node, f'mkdir -p "{target_dir}"'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            # Use scp to copy via the source node
+            # First copy to local temp, then to target
+            import tempfile
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp_path = tmp.name
+            
+            try:
+                # Copy from source to local temp
+                scp_from = subprocess.run(
+                    ['scp', '-o', 'StrictHostKeyChecking=no',
+                     f'{source_node}:{script_path}', tmp_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                
+                if scp_from.returncode != 0:
+                    print(f"    ✗ Failed to copy from {source_node}: {scp_from.stderr}")
+                    success = False
+                    continue
+                
+                # Copy from local temp to target
+                scp_to = subprocess.run(
+                    ['scp', '-o', 'StrictHostKeyChecking=no',
+                     tmp_path, f'{target_node}:{script_path}'],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                
+                if scp_to.returncode != 0:
+                    print(f"    ✗ Failed to copy to {target_node}: {scp_to.stderr}")
+                    success = False
+                    continue
+                
+                # Set execute permissions
+                chmod_result = subprocess.run(
+                    ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=5',
+                     target_node, f'chmod +x "{script_path}"'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                print(f"    ✓ Copied to {target_node}:{script_path}")
+                
+            finally:
+                # Clean up temp file
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+    
+    return success
+
+
 def update_slurmserver_overlay(skip_confirm: bool = False) -> tuple:
     """Update the slurm-server overlay to use all head nodes.
     
@@ -1104,16 +1318,17 @@ def main():
     # Normal migration flow
     print(
         "\nThis script will:\n"
-        "  1) Find the configuration overlay with the slurmserver role\n"
-        "  2) Update it to run on all BCM head nodes (allheadnodes=yes)\n"
-        "  3) Clear specific node assignments\n"
-        f"  4) Update WLM primaryserver to active head node ({primary_headnode})\n"
-        "  5) Restart slurmctld services to apply changes\n"
+        "  1) Check for PrologSlurmctld/EpilogSlurmctld scripts and copy if needed\n"
+        "  2) Find the configuration overlay with the slurmserver role\n"
+        "  3) Update it to run on all BCM head nodes (allheadnodes=yes)\n"
+        "  4) Clear specific node assignments\n"
+        f"  5) Update WLM primaryserver to active head node ({primary_headnode})\n"
+        "  6) Restart slurmctld services to apply changes\n"
     )
     
     if ha_available:
         print(
-            "  6) Optionally configure automatic 'scontrol takeover' on BCM failover\n"
+            "  7) Optionally configure automatic 'scontrol takeover' on BCM failover\n"
             "     This ensures Slurm controller moves to the active head node\n"
         )
     
@@ -1121,6 +1336,9 @@ def main():
     if answer not in ("y", "yes"):
         print("Aborting at user request.")
         sys.exit(0)
+    
+    # Step 0: Check and copy slurmctld prolog/epilog scripts if needed
+    copy_slurmctld_scripts_to_headnodes(wlm_cluster, primary_headnode, secondary_headnode, skip_confirm=False)
     
     # Step 1: Update the overlay
     success, overlay_name, original_nodes = update_slurmserver_overlay(skip_confirm=False)
