@@ -481,6 +481,106 @@ def restart_slurmctld_services(skip_confirm: bool = False) -> bool:
         return False
 
 
+def validate_nodes_exist(node_list: str) -> tuple:
+    """Validate that the specified nodes exist in BCM.
+    
+    Args:
+        node_list: Comma-separated list of node names
+        
+    Returns:
+        Tuple of (all_valid: bool, valid_nodes: list, invalid_nodes: list)
+    """
+    cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+    
+    # Get list of all devices from BCM
+    result = subprocess.run(
+        [cmsh_path, '-c', 'device; list'],
+        capture_output=True,
+        text=True,
+        timeout=30
+    )
+    
+    # Parse device list to get hostnames
+    bcm_devices = set()
+    for line in result.stdout.split('\n'):
+        line = line.strip()
+        if not line or line.startswith('Type') or line.startswith('-'):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            # Hostname is typically the second column
+            hostname = parts[1]
+            bcm_devices.add(hostname)
+    
+    # Check each node
+    nodes = [n.strip() for n in node_list.split(',') if n.strip()]
+    valid_nodes = []
+    invalid_nodes = []
+    
+    for node in nodes:
+        if node in bcm_devices:
+            valid_nodes.append(node)
+        else:
+            invalid_nodes.append(node)
+    
+    return (len(invalid_nodes) == 0, valid_nodes, invalid_nodes)
+
+
+def verify_overlay_config(overlay_name: str, expected_nodes: str = None, 
+                          expected_allheadnodes: str = None) -> tuple:
+    """Verify that an overlay has the expected configuration.
+    
+    Args:
+        overlay_name: Name of the overlay to check
+        expected_nodes: Expected nodes value (or None to skip check)
+        expected_allheadnodes: Expected allheadnodes value (or None to skip check)
+        
+    Returns:
+        Tuple of (matches: bool, actual_nodes: str, actual_allheadnodes: str)
+    """
+    cmsh_path = "/cm/local/apps/cmd/bin/cmsh"
+    
+    result = subprocess.run(
+        [cmsh_path, '-c', f'configurationoverlay; use {overlay_name}; show'],
+        capture_output=True,
+        text=True,
+        timeout=30
+    )
+    
+    actual_nodes = ""
+    actual_allheadnodes = ""
+    
+    for line in result.stdout.split('\n'):
+        line_lower = line.lower().strip()
+        
+        # Parse the Nodes line
+        if line_lower.startswith('nodes') and 'all head nodes' not in line_lower:
+            parts = line.split()
+            if len(parts) >= 2:
+                actual_nodes = ' '.join(parts[1:])
+        
+        # Parse the All head nodes line
+        if 'all head nodes' in line_lower:
+            parts = line.split()
+            if parts:
+                actual_allheadnodes = parts[-1].lower()
+    
+    matches = True
+    
+    if expected_nodes is not None:
+        # Normalize for comparison (empty string vs whitespace)
+        expected_normalized = expected_nodes.strip() if expected_nodes else ""
+        actual_normalized = actual_nodes.strip() if actual_nodes else ""
+        if expected_normalized != actual_normalized:
+            matches = False
+    
+    if expected_allheadnodes is not None:
+        if expected_allheadnodes.lower() != actual_allheadnodes.lower():
+            matches = False
+    
+    return (matches, actual_nodes, actual_allheadnodes)
+
+
 def find_slurmserver_overlay() -> tuple:
     """Find the configuration overlay that has the slurmserver role.
     
@@ -1052,9 +1152,27 @@ def update_slurmserver_overlay(skip_confirm: bool = False) -> tuple:
         )
         
         if result.returncode != 0:
-            raise RuntimeError(f"Overlay update failed: {result.stderr}")
+            print(f"  ⚠ cmsh returned non-zero exit code: {result.stderr}")
         
-        print(f"  ✓ Updated overlay: allheadnodes=yes, nodes cleared")
+        # Verify the changes were actually applied
+        print(f"  Verifying changes were applied...")
+        matches, actual_nodes, actual_allheadnodes = verify_overlay_config(
+            overlay_name, 
+            expected_nodes='',  # Should be empty
+            expected_allheadnodes='yes'
+        )
+        
+        if not matches:
+            print(f"\n  ✗ Verification FAILED - changes were not applied correctly!")
+            print(f"      Expected nodes: (empty)")
+            print(f"      Actual nodes:   {actual_nodes if actual_nodes else '(empty)'}")
+            print(f"      Expected allheadnodes: yes")
+            print(f"      Actual allheadnodes:   {actual_allheadnodes}")
+            print(f"\n  Please check BCM logs and try manually:")
+            print(f"    cmsh -c 'configurationoverlay; use {overlay_name}; set nodes; set allheadnodes yes; commit'")
+            return (False, overlay_name, current_nodes)
+        
+        print(f"  ✓ Verified: allheadnodes={actual_allheadnodes}, nodes cleared")
         return (True, overlay_name, current_nodes)
         
     except Exception as e:
@@ -1082,6 +1200,20 @@ def rollback_slurmserver_overlay(overlay_name: str, original_nodes: str, skip_co
         print("  Use: --rollback --original-nodes node1,node2")
         return False
     
+    # Validate that the specified nodes exist in BCM
+    print(f"\nValidating nodes exist in BCM...")
+    all_valid, valid_nodes, invalid_nodes = validate_nodes_exist(original_nodes)
+    
+    if invalid_nodes:
+        print(f"\n  ✗ Error: The following nodes do not exist in BCM:")
+        for node in invalid_nodes:
+            print(f"      - {node}")
+        print(f"\n  Available nodes can be listed with: cmsh -c 'device; list'")
+        print(f"\n  Please specify valid node names with --original-nodes")
+        return False
+    
+    print(f"  ✓ All nodes validated: {', '.join(valid_nodes)}")
+    
     print(f"\nPlanned changes:")
     print(f"  Overlay: {overlay_name}")
     print(f"    nodes         : {original_nodes}")
@@ -1107,9 +1239,29 @@ def rollback_slurmserver_overlay(overlay_name: str, original_nodes: str, skip_co
         )
         
         if result.returncode != 0:
-            raise RuntimeError(f"Rollback failed: {result.stderr}")
+            print(f"  ⚠ cmsh returned non-zero exit code: {result.stderr}")
         
-        print(f"  ✓ Rollback complete: nodes={original_nodes}, allheadnodes=no")
+        # Verify the changes were actually applied
+        print(f"\n  Verifying changes were applied...")
+        matches, actual_nodes, actual_allheadnodes = verify_overlay_config(
+            overlay_name, 
+            expected_nodes=original_nodes,
+            expected_allheadnodes='no'
+        )
+        
+        if not matches:
+            print(f"\n  ✗ Verification FAILED - changes were not applied correctly!")
+            print(f"      Expected nodes: {original_nodes}")
+            print(f"      Actual nodes:   {actual_nodes if actual_nodes else '(empty)'}")
+            print(f"      Expected allheadnodes: no")
+            print(f"      Actual allheadnodes:   {actual_allheadnodes}")
+            print(f"\n  The rollback did not complete successfully.")
+            print(f"  Please check BCM logs and try manually:")
+            print(f"    cmsh -c 'configurationoverlay; use {overlay_name}; set allheadnodes no; set nodes {original_nodes}; commit'")
+            return False
+        
+        print(f"  ✓ Verified: nodes={actual_nodes}, allheadnodes={actual_allheadnodes}")
+        print(f"  ✓ Rollback complete")
         return True
         
     except Exception as e:
