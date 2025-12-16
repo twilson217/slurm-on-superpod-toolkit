@@ -35,6 +35,7 @@ import subprocess
 import re
 import time
 import threading
+import getpass
 from datetime import datetime
 from pathlib import Path
 
@@ -256,13 +257,6 @@ def _parse_cmd_conf_db_creds(cmd_conf_path: str = "/cm/local/apps/cmd/etc/cmd.co
 
 def _local_mysql_base_args(socket_path: str | None = None) -> list:
     """Build base mysql CLI args for local MariaDB/MySQL, including auth if available."""
-    # Prefer Debian/Ubuntu maintenance credentials when available. This is the most
-    # reliable way to perform privileged operations (CREATE USER / GRANT / ALTER USER)
-    # on systems where socket auth for root is disabled.
-    debian_defaults = "/etc/mysql/debian.cnf"
-    if os.path.exists(debian_defaults):
-        return ["mysql", f"--defaults-file={debian_defaults}"]
-
     mysql_base = ["mysql"]
     if socket_path:
         mysql_base.extend(["--socket", socket_path])
@@ -275,6 +269,45 @@ def _local_mysql_base_args(socket_path: str | None = None) -> list:
         # This is consistent with existing script patterns for remote DB access.
         mysql_base.append(f"-p{creds['pass']}")
     return mysql_base
+
+
+def _local_mysql_admin_base_args(socket_path: str | None = None) -> list:
+    """Build mysql CLI args for privileged local operations (GRANT/ALTER USER).
+
+    We try, in order:
+      1) Debian/Ubuntu maintenance creds in /etc/mysql/debian.cnf (if they have GRANT OPTION)
+      2) MySQL root over socket with no password (rare)
+      3) Prompt for MySQL root password and use it over socket
+    """
+    debian_defaults = "/etc/mysql/debian.cnf"
+    if os.path.exists(debian_defaults):
+        # Only use if it can actually GRANT (requires GRANT OPTION). If not, we
+        # fall back to root so we don't fail mid-migration.
+        probe = subprocess.run(
+            ["mysql", f"--defaults-file={debian_defaults}", "-N", "-e", "SHOW GRANTS FOR CURRENT_USER();"],
+            capture_output=True, text=True
+        )
+        if probe.returncode == 0 and "WITH GRANT OPTION" in (probe.stdout or ""):
+            return ["mysql", f"--defaults-file={debian_defaults}"]
+
+    # Try root with no password first (socket auth)
+    mysql_base = ["mysql"]
+    if socket_path:
+        mysql_base.extend(["--socket", socket_path])
+    probe_root = subprocess.run(
+        mysql_base + ["-u", "root", "-e", "SELECT 1;"],
+        capture_output=True, text=True
+    )
+    if probe_root.returncode == 0:
+        return mysql_base + ["-u", "root"]
+
+    # Prompt for root password (interactive run)
+    root_pw = getpass.getpass("Enter local MySQL root password (for GRANT/ALTER USER): ")
+    if not root_pw:
+        raise RuntimeError(
+            "No MySQL root password provided. Cannot perform GRANT/ALTER USER on local DB."
+        )
+    return mysql_base + ["-u", "root", f"-p{root_pw}"]
 
 
 def run_ssh(host: str, cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
@@ -1416,6 +1449,8 @@ def import_db_to_local(cfg, dump_path: Path):
     storage_pass = cfg["storage_pass"]
 
     socket_path = detect_mysql_socket()
+    # Use cmdaemon DB creds (from cmd.conf) for create/import. On BCM systems this
+    # commonly works even when root socket auth is disabled.
     mysql_base = _local_mysql_base_args(socket_path if socket_path else None)
 
     print("\nCreating database on local MariaDB/MySQL ...")
@@ -1492,6 +1527,7 @@ def import_db_to_local(cfg, dump_path: Path):
     print(f"  ✓ Import completed: {final_table_count} tables in {format_time(elapsed)}")
 
     print("Granting privileges to Slurm DB user on local MariaDB/MySQL ...")
+    mysql_admin_base = _local_mysql_admin_base_args(socket_path if socket_path else None)
     # Use mysql_native_password for compatibility between MySQL 8.x and MariaDB
     # MariaDB syntax: IDENTIFIED VIA mysql_native_password USING PASSWORD('...')
     # MySQL syntax: IDENTIFIED WITH mysql_native_password BY '...'
@@ -1505,7 +1541,7 @@ def import_db_to_local(cfg, dump_path: Path):
     
     # Try MariaDB syntax first
     result = subprocess.run(
-        mysql_base + ["-e", grant_sql_mariadb],
+        mysql_admin_base + ["-e", grant_sql_mariadb],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -1521,7 +1557,7 @@ def import_db_to_local(cfg, dump_path: Path):
             f"FLUSH PRIVILEGES;"
         )
         result2 = subprocess.run(
-            mysql_base + ["-e", grant_sql_mysql],
+            mysql_admin_base + ["-e", grant_sql_mysql],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1535,7 +1571,7 @@ def import_db_to_local(cfg, dump_path: Path):
                 f"GRANT ALL PRIVILEGES ON `{storage_loc}`.* TO '{storage_user}'@'%'; "
                 f"FLUSH PRIVILEGES;"
             )
-            run_cmd(mysql_base + ["-e", grant_sql_simple])
+            run_cmd(mysql_admin_base + ["-e", grant_sql_simple])
     
     # Ensure the password is set correctly even if user already existed
     # This is critical when migrating to BCM head nodes where the slurm user
@@ -1543,7 +1579,7 @@ def import_db_to_local(cfg, dump_path: Path):
     print("  Ensuring Slurm DB user password matches slurmdbd.conf on local node...")
     alter_sql = f"ALTER USER '{storage_user}'@'%' IDENTIFIED BY '{storage_pass}'; FLUSH PRIVILEGES;"
     result = subprocess.run(
-        mysql_base + ["-e", alter_sql],
+        mysql_admin_base + ["-e", alter_sql],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
