@@ -222,6 +222,54 @@ def detect_mysql_socket() -> str:
     return ""
 
 
+def _parse_cmd_conf_db_creds(cmd_conf_path: str = "/cm/local/apps/cmd/etc/cmd.conf") -> dict:
+    """Parse BCM cmd.conf for local DB credentials.
+
+    We use DBUser/DBPass here because on many BCM systems local MariaDB does not
+    allow passwordless root via socket, and the cmdaemon DB user has sufficient
+    privileges for schema/user management.
+    """
+    creds = {"user": None, "pass": None}
+    if not os.path.exists(cmd_conf_path):
+        return creds
+    try:
+        # Example lines:
+        # DBUser = "cmdaemon"
+        # DBPass = "secret"
+        user_re = re.compile(r'^\s*DBUser\s*=\s*"([^"]*)"\s*$')
+        pass_re = re.compile(r'^\s*DBPass\s*=\s*"([^"]*)"\s*$')
+        with open(cmd_conf_path, "r") as f:
+            for line in f:
+                m = user_re.match(line)
+                if m:
+                    creds["user"] = m.group(1)
+                    continue
+                m = pass_re.match(line)
+                if m:
+                    creds["pass"] = m.group(1)
+                    continue
+    except Exception:
+        # Best-effort: caller can still attempt passwordless auth
+        return creds
+    return creds
+
+
+def _local_mysql_base_args(socket_path: str | None = None) -> list:
+    """Build base mysql CLI args for local MariaDB/MySQL, including auth if available."""
+    mysql_base = ["mysql"]
+    if socket_path:
+        mysql_base.extend(["--socket", socket_path])
+
+    creds = _parse_cmd_conf_db_creds()
+    if creds.get("user"):
+        mysql_base.extend(["-u", creds["user"]])
+    if creds.get("pass"):
+        # Note: passing password on CLI can be visible to process listing.
+        # This is consistent with existing script patterns for remote DB access.
+        mysql_base.append(f"-p{creds['pass']}")
+    return mysql_base
+
+
 def run_ssh(host: str, cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
     """Run a command on a remote host via SSH."""
     ssh_cmd = [
@@ -1361,9 +1409,7 @@ def import_db_to_local(cfg, dump_path: Path):
     storage_pass = cfg["storage_pass"]
 
     socket_path = detect_mysql_socket()
-    mysql_base = ["mysql"]
-    if socket_path:
-        mysql_base.extend(["--socket", socket_path])
+    mysql_base = _local_mysql_base_args(socket_path if socket_path else None)
 
     print("\nCreating database on local MariaDB/MySQL ...")
     create_db_sql = (
@@ -1506,10 +1552,18 @@ def import_db_to_local(cfg, dump_path: Path):
     _, secondary_headnode = get_bcm_headnodes()
     if secondary_headnode:
         print(f"  Ensuring Slurm DB user password matches on secondary node ({secondary_headnode})...")
-        # Use ssh to run the ALTER USER on the secondary node
+        # Use ssh to run the ALTER USER on the secondary node.
+        # Use BCM cmd.conf DB creds there as well (typically DBUser/DBPass = cmdaemon).
+        remote_mysql = "mysql"
+        remote_creds = _parse_cmd_conf_db_creds()
+        remote_auth = ""
+        if remote_creds.get("user"):
+            remote_auth += f" -u {remote_creds['user']}"
+        if remote_creds.get("pass"):
+            remote_auth += f" -p{remote_creds['pass']}"
         ssh_cmd = [
             "ssh", secondary_headnode,
-            f"mysql -e \"ALTER USER '{storage_user}'@'%' IDENTIFIED BY '{storage_pass}'; FLUSH PRIVILEGES;\""
+            f"{remote_mysql}{remote_auth} -e \"ALTER USER '{storage_user}'@'%' IDENTIFIED BY '{storage_pass}'; FLUSH PRIVILEGES;\""
         ]
         result = subprocess.run(
             ssh_cmd,
