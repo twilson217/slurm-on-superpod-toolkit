@@ -256,6 +256,13 @@ def _parse_cmd_conf_db_creds(cmd_conf_path: str = "/cm/local/apps/cmd/etc/cmd.co
 
 def _local_mysql_base_args(socket_path: str | None = None) -> list:
     """Build base mysql CLI args for local MariaDB/MySQL, including auth if available."""
+    # Prefer Debian/Ubuntu maintenance credentials when available. This is the most
+    # reliable way to perform privileged operations (CREATE USER / GRANT / ALTER USER)
+    # on systems where socket auth for root is disabled.
+    debian_defaults = "/etc/mysql/debian.cnf"
+    if os.path.exists(debian_defaults):
+        return ["mysql", f"--defaults-file={debian_defaults}"]
+
     mysql_base = ["mysql"]
     if socket_path:
         mysql_base.extend(["--socket", socket_path])
@@ -1555,15 +1562,19 @@ def import_db_to_local(cfg, dump_path: Path):
         # Use ssh to run the ALTER USER on the secondary node.
         # Use BCM cmd.conf DB creds there as well (typically DBUser/DBPass = cmdaemon).
         remote_mysql = "mysql"
+        # Prefer /etc/mysql/debian.cnf on the remote node if it exists, otherwise fall back
+        # to cmd.conf DBUser/DBPass.
         remote_creds = _parse_cmd_conf_db_creds()
         remote_auth = ""
+        remote_auth_fallback = ""
         if remote_creds.get("user"):
-            remote_auth += f" -u {remote_creds['user']}"
+            remote_auth_fallback += f" -u {remote_creds['user']}"
         if remote_creds.get("pass"):
-            remote_auth += f" -p{remote_creds['pass']}"
+            remote_auth_fallback += f" -p{remote_creds['pass']}"
+        remote_auth = f" --defaults-file=/etc/mysql/debian.cnf"
         ssh_cmd = [
             "ssh", secondary_headnode,
-            f"{remote_mysql}{remote_auth} -e \"ALTER USER '{storage_user}'@'%' IDENTIFIED BY '{storage_pass}'; FLUSH PRIVILEGES;\""
+            f"bash -lc \"{remote_mysql}{remote_auth} -e \\\"ALTER USER '{storage_user}'@'%' IDENTIFIED BY '{storage_pass}'; FLUSH PRIVILEGES;\\\" || {remote_mysql}{remote_auth_fallback} -e \\\"ALTER USER '{storage_user}'@'%' IDENTIFIED BY '{storage_pass}'; FLUSH PRIVILEGES;\\\"\""
         ]
         result = subprocess.run(
             ssh_cmd,
