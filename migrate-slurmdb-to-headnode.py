@@ -39,6 +39,8 @@ import getpass
 from datetime import datetime
 from pathlib import Path
 
+_CACHED_LOCAL_MYSQL_ADMIN_ARGS: list | None = None
+
 
 def confirm_prompt(prompt: str, default_yes: bool = False) -> bool:
     """Prompt user for confirmation with robust input handling.
@@ -279,6 +281,10 @@ def _local_mysql_admin_base_args(socket_path: str | None = None) -> list:
       2) MySQL root over socket with no password (rare)
       3) Prompt for MySQL root password and use it over socket
     """
+    global _CACHED_LOCAL_MYSQL_ADMIN_ARGS
+    if _CACHED_LOCAL_MYSQL_ADMIN_ARGS is not None:
+        return _CACHED_LOCAL_MYSQL_ADMIN_ARGS
+
     debian_defaults = "/etc/mysql/debian.cnf"
     if os.path.exists(debian_defaults):
         # Only use if it can actually GRANT (requires GRANT OPTION). If not, we
@@ -288,7 +294,8 @@ def _local_mysql_admin_base_args(socket_path: str | None = None) -> list:
             capture_output=True, text=True
         )
         if probe.returncode == 0 and "WITH GRANT OPTION" in (probe.stdout or ""):
-            return ["mysql", f"--defaults-file={debian_defaults}"]
+            _CACHED_LOCAL_MYSQL_ADMIN_ARGS = ["mysql", f"--defaults-file={debian_defaults}"]
+            return _CACHED_LOCAL_MYSQL_ADMIN_ARGS
 
     # Try root with no password first (socket auth)
     mysql_base = ["mysql"]
@@ -299,7 +306,8 @@ def _local_mysql_admin_base_args(socket_path: str | None = None) -> list:
         capture_output=True, text=True
     )
     if probe_root.returncode == 0:
-        return mysql_base + ["-u", "root"]
+        _CACHED_LOCAL_MYSQL_ADMIN_ARGS = mysql_base + ["-u", "root"]
+        return _CACHED_LOCAL_MYSQL_ADMIN_ARGS
 
     # Prompt for root password (interactive run)
     root_pw = getpass.getpass("Enter local MySQL root password (for GRANT/ALTER USER): ")
@@ -307,7 +315,32 @@ def _local_mysql_admin_base_args(socket_path: str | None = None) -> list:
         raise RuntimeError(
             "No MySQL root password provided. Cannot perform GRANT/ALTER USER on local DB."
         )
-    return mysql_base + ["-u", "root", f"-p{root_pw}"]
+    _CACHED_LOCAL_MYSQL_ADMIN_ARGS = mysql_base + ["-u", "root", f"-p{root_pw}"]
+    return _CACHED_LOCAL_MYSQL_ADMIN_ARGS
+
+
+def preflight_local_mysql_admin() -> None:
+    """Fail fast on local MySQL privilege requirements.
+
+    The migration can take a long time (large dump/import). If we cannot perform the
+    final GRANT/ALTER USER steps due to missing GRANT OPTION, we prompt for the MySQL
+    root password up front and cache it for later steps.
+    """
+    print("\nPreflight: checking local MySQL privileges needed for GRANT/ALTER USER ...")
+    socket_path = detect_mysql_socket()
+    mysql_admin = _local_mysql_admin_base_args(socket_path if socket_path else None)
+    # Verify the chosen auth path can actually execute something
+    probe = subprocess.run(
+        mysql_admin + ["-N", "-e", "SELECT 1;"],
+        capture_output=True, text=True
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(
+            "Local MySQL admin preflight failed. Cannot proceed with migration.\n"
+            f"Command: {' '.join(mysql_admin + ['-e', 'SELECT 1;'])}\n"
+            f"stderr:\n{probe.stderr}"
+        )
+    print("  ✓ Local MySQL admin preflight OK (GRANT/ALTER steps should succeed later).")
 
 
 def run_ssh(host: str, cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
@@ -2130,6 +2163,10 @@ def main():
 
     print(f"Using slurmdbd.conf: {conf_path}")
     cfg = parse_slurmdbd_conf(conf_path)
+
+    # Fail fast on local privilege prerequisites so we don't wait through a full
+    # dump/import just to fail on GRANT/ALTER at the end.
+    preflight_local_mysql_admin()
 
     # Get local hostname and determine BCM head nodes
     local_hostname = run_cmd(["hostname", "-s"], capture_output=True).stdout.strip()
