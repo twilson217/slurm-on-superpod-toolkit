@@ -370,10 +370,16 @@ def fix_remote_db_permissions(cfg, mysql_path: str = "/usr/bin/mysql") -> bool:
         return False
     
     # Build the SQL to grant access from any host
-    # We use socket auth as root to update the user permissions
+    # We use socket auth as root to update the user permissions.
+    #
+    # Note: mysqldump with --routines requires SHOW ROUTINE privilege to run
+    # SHOW CREATE PROCEDURE/FUNCTION. GRANT ALL on db.* does NOT reliably include
+    # SHOW ROUTINE (often treated as global), so we grant it explicitly.
     grant_sql = (
         f"GRANT ALL PRIVILEGES ON `{storage_loc}`.* TO '{storage_user}'@'%' "
-        f"IDENTIFIED BY '{storage_pass}'; FLUSH PRIVILEGES;"
+        f"IDENTIFIED BY '{storage_pass}'; "
+        f"GRANT SHOW ROUTINE ON *.* TO '{storage_user}'@'%'; "
+        f"FLUSH PRIVILEGES;"
     )
     
     # Escape single quotes for shell
@@ -397,6 +403,7 @@ def fix_remote_db_permissions(cfg, mysql_path: str = "/usr/bin/mysql") -> bool:
         alt_sql = (
             f"CREATE USER IF NOT EXISTS '{storage_user}'@'%' IDENTIFIED BY '{storage_pass}'; "
             f"GRANT ALL PRIVILEGES ON `{storage_loc}`.* TO '{storage_user}'@'%'; "
+            f"GRANT SHOW ROUTINE ON *.* TO '{storage_user}'@'%'; "
             f"FLUSH PRIVILEGES;"
         )
         alt_sql_escaped = alt_sql.replace("'", "'\"'\"'")
@@ -484,6 +491,100 @@ def ensure_db_connectivity(cfg) -> bool:
     else:
         print(f"\n  ✗ Unknown error connecting to database")
         return False
+
+
+def test_dump_privileges(cfg) -> tuple:
+    """Test whether the configured DB user can dump routines (SHOW CREATE PROCEDURE/FUNCTION).
+
+    Returns:
+        (success: bool, error_message: str)
+    """
+    storage_host = cfg["storage_host"]
+    storage_user = cfg["storage_user"]
+    storage_pass = cfg["storage_pass"]
+    storage_loc = cfg["storage_loc"]
+
+    # Find one procedure name (Slurm typically has procedures, e.g., get_coord_qos)
+    find_proc_sql = (
+        "SELECT ROUTINE_NAME FROM information_schema.routines "
+        f"WHERE ROUTINE_SCHEMA='{storage_loc}' AND ROUTINE_TYPE='PROCEDURE' "
+        "LIMIT 1;"
+    )
+    find_cmd = [
+        "mysql",
+        "-h", storage_host,
+        "-u", storage_user,
+        f"-p{storage_pass}",
+        "-N",
+        "-e", find_proc_sql,
+    ]
+    result = subprocess.run(find_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return (False, result.stderr.strip() or "Failed to query information_schema.routines")
+
+    proc_name = result.stdout.strip()
+    if not proc_name:
+        # No procedures found; dumping routines should be a no-op.
+        return (True, "")
+
+    # Try SHOW CREATE PROCEDURE on the first procedure we find
+    show_sql = f"SHOW CREATE PROCEDURE `{proc_name}`;"
+    show_cmd = [
+        "mysql",
+        "-h", storage_host,
+        "-u", storage_user,
+        f"-p{storage_pass}",
+        storage_loc,
+        "-e", show_sql,
+    ]
+    result = subprocess.run(show_cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        return (True, "")
+
+    return (False, result.stderr.strip() or f"Failed to run SHOW CREATE PROCEDURE {proc_name}")
+
+
+def ensure_dump_privileges(cfg) -> bool:
+    """Ensure the configured DB user can dump routines; attempt to fix if not.
+
+    This prevents mysqldump failures like:
+      "insufficient privileges to SHOW CREATE PROCEDURE ..."
+    """
+    storage_host = cfg["storage_host"]
+    storage_user = cfg["storage_user"]
+
+    print(f"\nChecking dump privileges (routines) on {storage_host}...")
+    ok, err = test_dump_privileges(cfg)
+    if ok:
+        print("  ✓ Routines dump privileges look OK")
+        return True
+
+    print(f"  ⚠ Routines dump privilege check failed: {err}")
+    print(f"  The DB user '{storage_user}' likely lacks SHOW ROUTINE privilege.")
+    print(f"  Attempting to fix this via SSH to {storage_host} (socket auth as root)...")
+
+    mysql_available, mysql_path = check_remote_mysql_client(storage_host)
+    if not mysql_available:
+        print(f"  ✗ MySQL client not found on {storage_host}; cannot auto-fix privileges.")
+        print(f"    Install a mysql client on {storage_host} and re-run, or grant manually:")
+        print(f"      GRANT SHOW ROUTINE ON *.* TO '{storage_user}'@'%'; FLUSH PRIVILEGES;")
+        return False
+
+    if not confirm_prompt(f"\n  Grant SHOW ROUTINE (and DB privileges) to '{storage_user}'@'%' on {storage_host}? [Y/n]: ", default_yes=True):
+        print("  Aborting. Please grant privileges manually and re-run.")
+        return False
+
+    if not fix_remote_db_permissions(cfg, mysql_path=mysql_path):
+        return False
+
+    print("\nRe-testing dump privileges...")
+    ok, err = test_dump_privileges(cfg)
+    if ok:
+        print("  ✓ Routines dump privileges OK after update")
+        return True
+
+    print(f"  ✗ Still failing routines privilege check: {err}")
+    return False
 
 
 def run_cmsh(cmsh_commands: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -1977,6 +2078,11 @@ def main():
     
     if not ensure_db_connectivity(cfg):
         print("\nERROR: Cannot establish database connectivity. Aborting.", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 0.25: Ensure we can dump routines (SHOW CREATE PROCEDURE) before starting a long mysqldump
+    if not ensure_dump_privileges(cfg):
+        print("\nERROR: Insufficient privileges to dump routines. Aborting.", file=sys.stderr)
         sys.exit(1)
 
     # Step 0.5: Prepare for migration (stop slurmdbd, kill connections)
